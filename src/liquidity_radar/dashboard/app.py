@@ -5,13 +5,16 @@ Run locally::
     streamlit run src/liquidity_radar/dashboard/app.py
 
 Five-tab layout: Dashboard · Market Snapshot · History · Stress Events · Methods.
+Live market panel auto-refreshes every 2 minutes using @st.fragment(run_every=...).
 All heavy data loads are cached with @st.cache_data(ttl=3600).
 """
 
 from __future__ import annotations
 
+import datetime
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT / "src") not in sys.path:
@@ -21,6 +24,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 import streamlit as st  # noqa: E402
+import yfinance as yf  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
 
 from liquidity_radar.config import DATA_DIR  # noqa: E402
@@ -50,7 +54,6 @@ FEATURE_LABELS: dict[str, str] = {
     "realized_vol_20d": "Realised Vol (20D Ann.)",
 }
 
-# Features where a lower (or more negative) value signals stress
 LOW_IS_STRESS: set[str] = {"yield_curve_slope", "spy_drawdown"}
 
 STATUS_LEVELS = [
@@ -74,9 +77,10 @@ MAJOR_EVENTS: dict[str, str] = {
 }
 
 STRESS_THRESHOLD = 0.5
+ET = ZoneInfo("America/New_York")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── General helpers ───────────────────────────────────────────────────────
 
 
 def _status(prob: float) -> tuple[str, str]:
@@ -88,20 +92,16 @@ def _status(prob: float) -> tuple[str, str]:
 
 def _batch_predict(X: np.ndarray, params: dict) -> np.ndarray:
     X_scaled = (X - params["scaler_mean"]) / params["scaler_scale"]
-    log_odds = X_scaled @ params["coef"] + params["intercept"][0]
-    return 1.0 / (1.0 + np.exp(-log_odds))
+    return 1.0 / (1.0 + np.exp(-(X_scaled @ params["coef"] + params["intercept"][0])))
 
 
 def _stress_percentile(col: str, series: pd.Series, today_val: float) -> float:
-    """Return percentile where high = more stressed (inverted for low-is-stress features)."""
     pct = float((series < today_val).mean())
-    if col in LOW_IS_STRESS:
-        pct = 1.0 - pct
-    return pct
+    return 1.0 - pct if col in LOW_IS_STRESS else pct
 
 
 def _percentile_color(pct: float) -> str:
-    if pct < 0.5:
+    if pct < 0.50:
         return "#2ecc71"
     if pct < 0.75:
         return "#f39c12"
@@ -111,21 +111,17 @@ def _percentile_color(pct: float) -> str:
 
 
 def _compute_stress_events(preds: pd.DataFrame, threshold: float = STRESS_THRESHOLD) -> pd.DataFrame:
-    """Identify stress onsets and compute lead times."""
     if preds.empty:
         return pd.DataFrame()
     df = preds.sort_values("date").copy()
     df["above"] = (df["prob"] > threshold).astype(int)
-    # onset = first day of each contiguous run above threshold
     df["onset"] = (df["above"] == 1) & (df["above"].shift(1, fill_value=0) == 0)
     onsets = df[df["onset"]].copy()
     if onsets.empty:
         return pd.DataFrame()
-
     rows = []
     for _, row in onsets.iterrows():
         onset_date = row["date"]
-        # look back up to 30 days for the first signal
         lookback_start = onset_date - pd.Timedelta(days=45)
         window = df[(df["date"] >= lookback_start) & (df["date"] < onset_date)]
         first_signal = window[window["prob"] > threshold]
@@ -135,13 +131,104 @@ def _compute_stress_events(preds: pd.DataFrame, threshold: float = STRESS_THRESH
                 "onset_date": onset_date,
                 "peak_prob": df[df["date"] >= onset_date].head(30)["prob"].max(),
                 "lead_days": lead_days,
-                "actual": row.get("actual", float("nan")),
             }
         )
     return pd.DataFrame(rows)
 
 
-# ── Cached loaders ────────────────────────────────────────────────────────
+# ── Live market helpers ───────────────────────────────────────────────────
+
+
+def _market_status() -> tuple[bool, str]:
+    """Return (is_open, human label) in US Eastern time."""
+    now = datetime.datetime.now(ET)
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now.weekday() >= 5:
+        return False, "Weekend"
+    if now < open_t:
+        mins = int((open_t - now).total_seconds() // 60)
+        h, m = divmod(mins, 60)
+        return False, f"Pre-Market · opens in {h}h {m}m" if h else f"Pre-Market · opens in {m}m"
+    if now > close_t:
+        return False, "After Hours"
+    mins = int((close_t - now).total_seconds() // 60)
+    h, m = divmod(mins, 60)
+    return True, f"Market Open · closes in {h}h {m}m" if h else f"Market Open · closes in {m}m"
+
+
+@st.cache_data(ttl=120)
+def fetch_live_snapshot() -> dict | None:
+    """Fetch latest SPY + VIX prices. Cached 2 minutes."""
+    try:
+        hist = yf.Tickers("SPY ^VIX ^VIX9D ^VIX3M").history(
+            period="7d", interval="1d", auto_adjust=True
+        )
+        close = hist["Close"]
+
+        def _g(col: str, i: int = 0) -> float:
+            try:
+                return float(close[col].dropna().iloc[-(1 + i)])
+            except Exception:
+                return float("nan")
+
+        return {
+            "spy": _g("SPY"),
+            "spy_prev": _g("SPY", 1),
+            "vix": _g("^VIX"),
+            "vix_prev": _g("^VIX", 1),
+            "vix9d": _g("^VIX9D"),
+            "vix3m": _g("^VIX3M"),
+            "fetched_at": datetime.datetime.now(ET),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def fetch_intraday_spy() -> pd.DataFrame:
+    """Fetch today's 5-min SPY bars. Cached 60 seconds."""
+    try:
+        df = yf.download("SPY", period="1d", interval="5m", progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _intraday_prob(
+    live: dict,
+    feat_clean: pd.DataFrame,
+    panel: pd.DataFrame,
+    params: dict,
+) -> float:
+    """Update yesterday's feature vector with live VIX/SPY and rerun the model."""
+    x = feat_clean.iloc[-1].to_numpy(dtype=float).copy()
+    vix = live["vix"]
+    # vix_5d_change: live VIX minus the close 5 trading days ago
+    if not np.isnan(vix):
+        vix_s = panel["vix"].dropna()
+        if len(vix_s) >= 5:
+            x[FEATURE_COLS.index("vix_5d_change")] = vix - float(vix_s.iloc[-5])
+    # vix_term_ratio: live VIX9D / VIX3M
+    v9 = live["vix9d"]
+    v3 = live["vix3m"]
+    if not np.isnan(v9) and not np.isnan(v3) and v3 > 0:
+        x[FEATURE_COLS.index("vix_term_ratio")] = v9 / v3
+    # spy_drawdown: live SPY price vs 252-day rolling high
+    spy_px = live["spy"]
+    if not np.isnan(spy_px):
+        spy_s = panel["adj_close"].dropna()
+        if len(spy_s) >= 252:
+            rolling_high = float(spy_s.iloc[-252:].max())
+            x[FEATURE_COLS.index("spy_drawdown")] = spy_px / rolling_high - 1.0
+    x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
+    log_odds = float(x_scaled @ params["coef"] + params["intercept"][0])
+    return float(1.0 / (1.0 + np.exp(-log_odds)))
+
+
+# ── Cached data loaders ───────────────────────────────────────────────────
 
 
 @st.cache_data(ttl=3600)
@@ -198,8 +285,7 @@ def load_predictions() -> pd.DataFrame:
 
 def predict_one(x: np.ndarray, params: dict) -> float:
     x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
-    log_odds = float(x_scaled @ params["coef"] + params["intercept"][0])
-    return float(1.0 / (1.0 + np.exp(-log_odds)))
+    return float(1.0 / (1.0 + np.exp(-(float(x_scaled @ params["coef"] + params["intercept"][0])))))
 
 
 def feature_contributions(x: np.ndarray, params: dict) -> np.ndarray:
@@ -219,7 +305,7 @@ tab_dash, tab_snap, tab_hist, tab_events, tab_methods = st.tabs(
     ["🎯 Dashboard", "📊 Market Snapshot", "📈 History", "⚡ Stress Events", "📚 Methods"]
 )
 
-# ── Shared data load ──────────────────────────────────────────────────────
+# ── Shared data (loaded once, tabs share it) ──────────────────────────────
 
 with st.spinner("Loading data…"):
     panel = load_panel()
@@ -234,7 +320,6 @@ if not params:
     )
     st.stop()
 
-# Shared state
 feat_clean = features.dropna()
 today_feat_row = feat_clean.iloc[-1]
 today_date = today_feat_row.name
@@ -243,16 +328,168 @@ today_prob = predict_one(x_today, params)
 status_label, status_color = _status(today_prob)
 oos_auc = float(params["oos_auc"][0]) if "oos_auc" in params else float("nan")
 
+
 # ══════════════════════════════════════════════════════════════════════════
-# TAB 1 — Dashboard (original)
+# TAB 1 — Dashboard
 # ══════════════════════════════════════════════════════════════════════════
 
 with tab_dash:
+
+    # ── Live market panel (auto-refreshes every 2 min) ────────────────────
+    @st.fragment(run_every=datetime.timedelta(seconds=120))
+    def _live_panel() -> None:
+        live = fetch_live_snapshot()
+        intraday = fetch_intraday_spy()
+        is_open, mkt_status = _market_status()
+
+        dot_color = "#2ecc71" if is_open else "#95a5a6"
+        pulse_anim = "pulse 1.5s infinite" if is_open else "none"
+        fetched_str = live["fetched_at"].strftime("%H:%M:%S ET") if live else "unavailable"
+
+        st.markdown(
+            f"""
+            <style>
+            @keyframes pulse {{
+                0%   {{ opacity: 1; }}
+                50%  {{ opacity: 0.3; }}
+                100% {{ opacity: 1; }}
+            }}
+            .live-dot {{
+                display: inline-block;
+                width: 10px; height: 10px;
+                border-radius: 50%;
+                background: {dot_color};
+                animation: {pulse_anim};
+                margin-right: 6px;
+                vertical-align: middle;
+            }}
+            .live-bar {{
+                display: flex; align-items: center;
+                padding: 8px 14px;
+                background: {"rgba(46,204,113,0.08)" if is_open else "rgba(149,165,166,0.08)"};
+                border-radius: 8px;
+                border-left: 3px solid {dot_color};
+                margin-bottom: 12px;
+            }}
+            </style>
+            <div class="live-bar">
+                <span class="live-dot"></span>
+                <span style="font-weight:600; font-size:0.95rem;">{mkt_status}</span>
+                <span style="margin-left:auto; color:#888; font-size:0.8rem;">
+                    Live data · refreshes every 2 min · last at {fetched_str}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if live is None:
+            st.warning("Could not reach yfinance — live data unavailable.")
+            return
+
+        spy_chg = (
+            (live["spy"] - live["spy_prev"]) / live["spy_prev"] * 100
+            if not np.isnan(live["spy_prev"]) and live["spy_prev"] > 0
+            else float("nan")
+        )
+        vix_chg = live["vix"] - live["vix_prev"] if not np.isnan(live["vix_prev"]) else float("nan")
+        live_vtr = live["vix9d"] / live["vix3m"] if live["vix3m"] > 0 else float("nan")
+
+        col_chart, col_metrics = st.columns([3, 1])
+
+        with col_metrics:
+            st.metric(
+                "SPY",
+                f"${live['spy']:.2f}" if not np.isnan(live["spy"]) else "—",
+                f"{spy_chg:+.2f}%" if not np.isnan(spy_chg) else None,
+            )
+            st.metric(
+                "VIX",
+                f"{live['vix']:.2f}" if not np.isnan(live["vix"]) else "—",
+                f"{vix_chg:+.2f}" if not np.isnan(vix_chg) else None,
+                delta_color="inverse",
+            )
+            st.metric(
+                "VIX Term Ratio",
+                f"{live_vtr:.3f}" if not np.isnan(live_vtr) else "—",
+                help="VIX9D / VIX3M — above 1 = near-term fear elevated vs 3-month",
+            )
+            if is_open:
+                ip = _intraday_prob(live, feat_clean, panel, params)
+                ip_label, ip_color = _status(ip)
+                st.metric(
+                    "Intraday Estimate",
+                    f"{ip*100:.1f}%",
+                    help="Live VIX + SPY drawdown plugged into yesterday's model",
+                )
+                st.markdown(
+                    f"<div style='text-align:center;background:{ip_color}22;"
+                    f"border:1px solid {ip_color};border-radius:6px;"
+                    f"padding:4px 8px;font-weight:600;color:{ip_color};"
+                    f"font-size:0.85rem;'>{ip_label}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Intraday estimate available during market hours (9:30–16:00 ET).")
+
+        with col_chart:
+            if not intraday.empty and "Close" in intraday.columns:
+                close_s = intraday["Close"].dropna()
+                if len(close_s) > 1:
+                    open_px = float(close_s.iloc[0])
+                    line_color = "#2ecc71" if close_s.iloc[-1] >= open_px else "#e74c3c"
+                    fill_color = (
+                        "rgba(46,204,113,0.10)" if close_s.iloc[-1] >= open_px else "rgba(231,76,60,0.10)"
+                    )
+                    fig_intra = go.Figure()
+                    fig_intra.add_trace(
+                        go.Scatter(
+                            x=intraday.index,
+                            y=close_s,
+                            mode="lines",
+                            line=dict(color=line_color, width=2),
+                            fill="tozeroy",
+                            fillcolor=fill_color,
+                            name="SPY intraday",
+                        )
+                    )
+                    fig_intra.add_hline(
+                        y=open_px,
+                        line_dash="dot",
+                        line_color="grey",
+                        line_width=1,
+                        annotation_text="Open",
+                        annotation_position="right",
+                    )
+                    fig_intra.update_layout(
+                        height=220,
+                        margin=dict(t=10, b=10, l=10, r=60),
+                        xaxis_title=None,
+                        yaxis_title="SPY ($)",
+                        yaxis_tickprefix="$",
+                        showlegend=False,
+                        title=dict(
+                            text="SPY — Today (5-min bars)",
+                            font=dict(size=13),
+                            x=0,
+                        ),
+                    )
+                    st.plotly_chart(fig_intra, use_container_width=True)
+                else:
+                    st.caption("Intraday chart: waiting for market open data.")
+            else:
+                st.caption("Intraday chart unavailable outside market hours.")
+
+        st.divider()
+
+    _live_panel()
+
+    # ── Today's gauge + sparkline + status ───────────────────────────────
     col_gauge, col_spark, col_status = st.columns([1, 2, 1])
 
     with col_gauge:
-        st.subheader("Today's Stress Probability")
-        st.caption(f"As of {today_date.date()}")
+        st.subheader("Yesterday's Close Probability")
+        st.caption(f"Model run on {today_date.date()} close data")
         gauge = go.Figure(
             go.Indicator(
                 mode="gauge+number",
@@ -325,6 +562,7 @@ with tab_dash:
 
     st.divider()
 
+    # ── Feature contributions + KPI ───────────────────────────────────────
     col_contrib, col_kpi = st.columns([3, 2])
 
     with col_contrib:
@@ -361,7 +599,6 @@ with tab_dash:
             delta=f"+{oos_auc - 0.49:.3f} vs VIX-only",
             delta_color="normal",
         )
-
         if not predictions.empty:
             from liquidity_radar.eval.metrics import compute_lead_time
 
@@ -371,7 +608,6 @@ with tab_dash:
                 f"{lead['mean']:.0f} days" if not pd.isna(lead["mean"]) else "N/A",
                 help="Days before stress onset that model first signals prob > 0.5",
             )
-
         today_vals = pd.Series(x_today, index=FEATURE_COLS)
         st.caption("**Today's raw feature values:**")
         for col, val in today_vals.items():
@@ -385,11 +621,10 @@ with tab_dash:
 with tab_snap:
     st.subheader(f"Market Snapshot — {today_date.date()}")
     st.caption(
-        "Each card shows today's value and its **stress percentile** (how alarming this reading "
-        "is vs. all history). Red = top decile stress."
+        "Each card shows today's value and its **stress percentile** vs. full history. "
+        "Red = top decile alarm."
     )
 
-    # Compute percentiles for all 8 features
     pct_data: list[dict] = []
     for col in FEATURE_COLS:
         series = feat_clean[col].dropna()
@@ -405,7 +640,6 @@ with tab_snap:
             }
         )
 
-    # 4-column grid of metric cards
     cols = st.columns(4)
     for i, d in enumerate(pct_data):
         with cols[i % 4]:
@@ -431,8 +665,6 @@ with tab_snap:
             )
 
     st.divider()
-
-    # Horizontal percentile bar chart
     st.subheader("Stress Percentile Overview")
     pct_df = pd.DataFrame(pct_data).sort_values("percentile", ascending=True)
     bar_colors = [d["color"] for d in pct_df.to_dict("records")]
@@ -458,19 +690,14 @@ with tab_snap:
     st.plotly_chart(pct_fig, use_container_width=True)
 
     st.divider()
-
-    # Summary table
     st.subheader("Feature Summary Table")
     hist_stats = feat_clean.describe(percentiles=[0.25, 0.5, 0.75, 0.90]).T
     hist_stats = hist_stats[["min", "25%", "50%", "75%", "90%", "max"]]
     hist_stats.index = [FEATURE_LABELS[c] for c in hist_stats.index]
     today_series = pd.Series(
-        {FEATURE_LABELS[c]: float(today_feat_row[c]) for c in FEATURE_COLS},
-        name="Today",
+        {FEATURE_LABELS[c]: float(today_feat_row[c]) for c in FEATURE_COLS}, name="Today"
     )
-    table_df = hist_stats.join(today_series)
-    table_df = table_df.round(4)
-    st.dataframe(table_df, use_container_width=True)
+    st.dataframe(hist_stats.join(today_series).round(4), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -501,7 +728,6 @@ with tab_hist:
     hist_feat = feat_clean.loc[date_mask]
     hist_probs = _batch_predict(hist_feat.to_numpy(dtype=float), params)
 
-    # Dual-axis chart: feature on top, probability on bottom
     fig_hist = make_subplots(
         rows=2,
         cols=1,
@@ -510,7 +736,6 @@ with tab_hist:
         vertical_spacing=0.06,
         subplot_titles=[FEATURE_LABELS[selected_feature], "Stress Probability"],
     )
-
     fig_hist.add_trace(
         go.Scatter(
             x=hist_feat.index,
@@ -522,8 +747,6 @@ with tab_hist:
         row=1,
         col=1,
     )
-
-    # Shade stress zones on feature panel
     fig_hist.add_trace(
         go.Scatter(
             x=hist_feat.index,
@@ -539,7 +762,6 @@ with tab_hist:
     )
     fig_hist.add_hline(y=50, line_dash="dash", line_color="grey", line_width=1, row=2, col=1)
 
-    # Annotate major events
     for date_str, label in MAJOR_EVENTS.items():
         ev_date = pd.Timestamp(date_str)
         if year_range[0] <= ev_date.year <= year_range[1]:
@@ -571,15 +793,12 @@ with tab_hist:
     st.plotly_chart(fig_hist, use_container_width=True)
 
     st.divider()
-
-    # Full probability history
-    st.subheader("Full Probability History (all out-of-sample folds)")
+    st.subheader("Full OOS Probability History")
     if not predictions.empty:
         pred_mask = (predictions["date"].dt.year >= year_range[0]) & (
             predictions["date"].dt.year <= year_range[1]
         )
         pred_view = predictions.loc[pred_mask].sort_values("date")
-
         fig_oos = go.Figure()
         fig_oos.add_trace(
             go.Scatter(
@@ -623,7 +842,7 @@ with tab_hist:
 with tab_events:
     st.subheader("Stress Event Analysis")
     st.caption(
-        f"A stress event onset is defined as the first day the model probability exceeds "
+        f"A stress event onset is the first day the model probability exceeds "
         f"{STRESS_THRESHOLD*100:.0f}% after a period below that threshold."
     )
 
@@ -631,11 +850,9 @@ with tab_events:
         st.info("No predictions found. Run `scripts/02_train_logistic.py` first.")
     else:
         events_df = _compute_stress_events(predictions, threshold=STRESS_THRESHOLD)
-
         if events_df.empty:
             st.info("No stress onsets detected in out-of-sample predictions.")
         else:
-            # Summary metrics
             m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("Total stress onsets", len(events_df))
@@ -645,7 +862,6 @@ with tab_events:
                 st.metric(
                     "Mean lead time",
                     f"{avg_lead:.0f} days" if not pd.isna(avg_lead) else "N/A",
-                    help="Days before onset that model first crossed threshold",
                 )
             with m3:
                 med_lead = valid_lead.median() if not valid_lead.empty else float("nan")
@@ -654,12 +870,9 @@ with tab_events:
                     f"{med_lead:.0f} days" if not pd.isna(med_lead) else "N/A",
                 )
             with m4:
-                max_prob = events_df["peak_prob"].max()
-                st.metric("Max peak prob", f"{max_prob*100:.1f}%")
+                st.metric("Max peak prob", f"{events_df['peak_prob'].max()*100:.1f}%")
 
             st.divider()
-
-            # Lead-time histogram
             col_hist_lead, col_event_table = st.columns([1, 1])
 
             with col_hist_lead:
@@ -667,12 +880,7 @@ with tab_events:
                 lead_vals = events_df["lead_days"].replace(0, np.nan).dropna()
                 if not lead_vals.empty:
                     lead_fig = go.Figure(
-                        go.Histogram(
-                            x=lead_vals,
-                            nbinsx=20,
-                            marker_color="#4393c3",
-                            opacity=0.8,
-                        )
+                        go.Histogram(x=lead_vals, nbinsx=20, marker_color="#4393c3", opacity=0.8)
                     )
                     lead_fig.add_vline(
                         x=float(lead_vals.mean()),
@@ -689,29 +897,28 @@ with tab_events:
                         showlegend=False,
                     )
                     st.plotly_chart(lead_fig, use_container_width=True)
-                else:
-                    st.info("All onsets had zero lead time.")
 
             with col_event_table:
                 st.subheader("Onset Table")
                 display_events = events_df.copy()
                 display_events["onset_date"] = display_events["onset_date"].dt.date
-                display_events["peak_prob"] = (display_events["peak_prob"] * 100).round(1).astype(str) + "%"
+                display_events["peak_prob"] = (
+                    (display_events["peak_prob"] * 100).round(1).astype(str) + "%"
+                )
                 display_events["lead_days"] = display_events["lead_days"].astype(int)
                 display_events = display_events.rename(
                     columns={
                         "onset_date": "Onset Date",
                         "peak_prob": "Peak Prob",
                         "lead_days": "Lead Days",
-                        "actual": "Actual Stress",
                     }
                 )
-                display_events = display_events.drop(columns=["Actual Stress"], errors="ignore")
-                st.dataframe(display_events.sort_values("Onset Date", ascending=False), use_container_width=True)
+                st.dataframe(
+                    display_events.sort_values("Onset Date", ascending=False),
+                    use_container_width=True,
+                )
 
             st.divider()
-
-            # Probability timeline with stress onset markers
             st.subheader("Stress Probability with Onset Markers")
             pred_sorted = predictions.sort_values("date")
             fig_ev = go.Figure()
@@ -726,24 +933,19 @@ with tab_events:
                     name="Stress probability",
                 )
             )
-            # Shade above-threshold regions
             above = pred_sorted[pred_sorted["prob"] > STRESS_THRESHOLD]
             fig_ev.add_trace(
                 go.Scatter(
                     x=above["date"],
                     y=above["prob"] * 100,
                     mode="markers",
-                    marker=dict(color="rgba(214,96,77,0.3)", size=3, symbol="circle"),
+                    marker=dict(color="rgba(214,96,77,0.3)", size=3),
                     name="Above threshold",
                 )
             )
-            # Mark onsets
             for _, ev_row in events_df.iterrows():
                 fig_ev.add_vline(
-                    x=ev_row["onset_date"],
-                    line_color="#e74c3c",
-                    line_width=1.5,
-                    line_dash="dot",
+                    x=ev_row["onset_date"], line_color="#e74c3c", line_width=1.5, line_dash="dot"
                 )
             fig_ev.add_hline(
                 y=STRESS_THRESHOLD * 100,
@@ -753,7 +955,6 @@ with tab_events:
                 annotation_text=f"{STRESS_THRESHOLD*100:.0f}% threshold",
                 annotation_position="bottom right",
             )
-            # Major event annotations
             for date_str, label in MAJOR_EVENTS.items():
                 ev_date = pd.Timestamp(date_str)
                 if pred_sorted["date"].min() <= ev_date <= pred_sorted["date"].max():
@@ -779,7 +980,7 @@ with tab_events:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# TAB 5 — Methods (original)
+# TAB 5 — Methods
 # ══════════════════════════════════════════════════════════════════════════
 
 with tab_methods:
@@ -811,6 +1012,16 @@ with tab_methods:
 | Technical | SPY drawdown | Distance from 252-day rolling high |
 | Technical | Realised vol (20D) | Annualised standard deviation of daily returns |
         """
+    )
+
+    st.subheader("Live intraday estimate")
+    st.markdown(
+        "The **Intraday Estimate** on the Dashboard tab updates every 2 minutes during market "
+        "hours. It takes the previous close's feature vector and replaces three features with "
+        "live values from yfinance: `vix_5d_change` (live VIX vs. 5 trading days ago), "
+        "`vix_term_ratio` (live VIX9D / VIX3M), and `spy_drawdown` (live SPY price vs. "
+        "252-day rolling high). The four OHLC-dependent features (Amihud, CS, EDGE, realised "
+        "vol) stay at yesterday's values since they require a completed trading session."
     )
 
     st.subheader("Model")
