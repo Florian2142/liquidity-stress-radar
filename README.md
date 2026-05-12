@@ -2,7 +2,6 @@
 
 A binary classifier that predicts S&P 500 drawdowns of 5% or more in the next 20 trading days, using market microstructure liquidity signals (Amihud illiquidity, Corwin–Schultz spread proxy, EDGE estimator) alongside volatility and macro features (VIX, VIX term structure, yield curve).
 
-This is the term project for **Introduction to Data Science in Finance using Python** at TUM CEFS (Sara Boni, Ph.D.). Three-person team, due July 5, 2026.
 
 ## Research question
 
