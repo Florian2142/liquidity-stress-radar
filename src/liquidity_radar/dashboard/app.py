@@ -198,7 +198,10 @@ with tab_dash:
     with col_spark:
         st.subheader("90-Day Probability Trend")
         recent = features.dropna().iloc[-90:]
-        probs_90 = np.array([predict_one(row.to_numpy(dtype=float), params) for row in recent.itertuples(index=False)])
+        X_90 = recent.to_numpy(dtype=float)
+        X_90_scaled = (X_90 - params["scaler_mean"]) / params["scaler_scale"]
+        log_odds_90 = X_90_scaled @ params["coef"] + params["intercept"][0]
+        probs_90 = 1.0 / (1.0 + np.exp(-log_odds_90))
         spark = go.Figure()
         spark.add_trace(
             go.Scatter(
