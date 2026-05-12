@@ -1,10 +1,12 @@
 """Liquidity proxies computed from daily OHLCV.
 
-Three estimators implemented in the MVP:
+Five estimators:
 
-- :func:`amihud_illiquidity` (Amihud, 2002)
-- :func:`corwin_schultz_spread` (Corwin & Schultz, 2012) — Phase 2
-- :func:`edge_spread` via the ``bidask`` package (Ardia et al., 2024) — Phase 2
+- :func:`amihud_illiquidity` (Amihud, 2002) — raw 20-day rolling mean
+- :func:`amihud_zscore` — Amihud normalised against its own trailing 252-day history
+- :func:`amihud_5d_change` — 5-day momentum in Amihud (analogous to vix_5d_change)
+- :func:`corwin_schultz_spread` (Corwin & Schultz, 2012)
+- :func:`edge_spread` via the ``bidask`` package (Ardia et al., 2024)
 
 All functions take a DataFrame with at minimum the columns they need and return
 a Series indexed by date.
@@ -18,6 +20,8 @@ import numpy as np
 import pandas as pd
 
 from liquidity_radar.config import AMIHUD_WINDOW
+
+AMIHUD_ZSCORE_WINDOW = 252  # trading days of history used for rolling normalisation
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,63 @@ def amihud_illiquidity(
     per_day = per_day.replace([np.inf, -np.inf], np.nan)
 
     return per_day.rolling(window, min_periods=window).mean().rename("amihud")
+
+
+def amihud_zscore(
+    prices: pd.DataFrame,
+    window: int = AMIHUD_WINDOW,
+    z_window: int = AMIHUD_ZSCORE_WINDOW,
+) -> pd.Series:
+    """Amihud illiquidity z-scored against its own trailing 252-day history.
+
+    Removes the secular downward trend in market liquidity (decimalization,
+    algorithmic market-making) by asking: *how unusual is today's illiquidity
+    relative to the recent regime?* A reading of +2 means twice as illiquid
+    as normal for this market environment.
+
+    Parameters
+    ----------
+    prices : DataFrame
+        Indexed by date. Must contain ``adj_close`` and ``volume``.
+    window : int
+        Inner Amihud rolling window (default: 20 days).
+    z_window : int
+        Outer rolling window for the z-score normalisation (default: 252 days).
+
+    Returns
+    -------
+    Series
+        Z-scored Amihud. First valid value appears at index ``window + z_window``.
+    """
+    illiq = amihud_illiquidity(prices, window=window)
+    rolling_mean = illiq.rolling(z_window, min_periods=z_window).mean()
+    rolling_std = illiq.rolling(z_window, min_periods=z_window).std()
+    return ((illiq - rolling_mean) / rolling_std).rename("amihud_zscore")
+
+
+def amihud_5d_change(
+    prices: pd.DataFrame,
+    window: int = AMIHUD_WINDOW,
+) -> pd.Series:
+    """5-day change in the Amihud 20-day rolling mean.
+
+    Captures *deteriorating* liquidity: a sudden spike in illiquidity is more
+    predictive of stress than the absolute level (analogous to ``vix_5d_change``).
+
+    Parameters
+    ----------
+    prices : DataFrame
+        Indexed by date. Must contain ``adj_close`` and ``volume``.
+    window : int
+        Inner Amihud rolling window (default: 20 days).
+
+    Returns
+    -------
+    Series
+        First-difference of the rolling Amihud over 5 trading days.
+    """
+    illiq = amihud_illiquidity(prices, window=window)
+    return illiq.diff(5).rename("amihud_5d_change")
 
 
 def corwin_schultz_spread(prices: pd.DataFrame) -> pd.Series:

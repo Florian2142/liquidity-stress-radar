@@ -10,8 +10,11 @@ from sklearn.preprocessing import StandardScaler
 from liquidity_radar.config import RANDOM_SEED
 
 # Canonical ordered feature list — must match the DuckDB ``features`` table schema.
+# amihud_zscore and amihud_5d_change replace the raw amihud level (see scripts/04_amihud_variants.py).
+# Variant experiment result: zscore+5d_chg OOS AUC = 0.6753 vs. level 0.6659 (+0.0094).
 FEATURE_COLS: list[str] = [
-    "amihud",
+    "amihud_zscore",
+    "amihud_5d_change",
     "cs_spread",
     "edge",
     "vix_5d_change",

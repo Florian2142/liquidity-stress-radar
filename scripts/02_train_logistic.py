@@ -25,7 +25,13 @@ from sklearn.metrics import roc_auc_score  # noqa: E402
 
 from liquidity_radar.config import DATA_DIR, ensure_dirs  # noqa: E402
 from liquidity_radar.data.store import get_connection, get_features_panel, upsert_dataframe  # noqa: E402
-from liquidity_radar.features.liquidity import amihud_illiquidity, corwin_schultz_spread, edge_spread  # noqa: E402
+from liquidity_radar.features.liquidity import (  # noqa: E402
+    amihud_5d_change,
+    amihud_illiquidity,
+    amihud_zscore,
+    corwin_schultz_spread,
+    edge_spread,
+)
 from liquidity_radar.features.macro import yield_curve_slope  # noqa: E402
 from liquidity_radar.features.target import forward_drawdown_label  # noqa: E402
 from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
@@ -39,19 +45,26 @@ logger = logging.getLogger("02_train_logistic")
 
 
 def build_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """Compute all 8 features from the raw joined panel.
+    """Compute all 9 features from the raw joined panel.
+
+    Amihud illiquidity is represented as two complementary signals
+    (zscore + 5d-change) rather than the raw level — see scripts/04_amihud_variants.py
+    for the experiment that established this (OOS AUC +0.0094 vs. raw level).
+    The raw amihud level is also stored in DuckDB for reference but is not in FEATURE_COLS.
 
     Returns a DataFrame with the same DatetimeIndex as ``panel`` and
     exactly the columns listed in ``FEATURE_COLS``.
     """
     feat = pd.DataFrame(index=panel.index)
-    feat["amihud"] = amihud_illiquidity(panel)
-    feat["cs_spread"] = corwin_schultz_spread(panel)
-    feat["edge"] = edge_spread(panel)
-    feat["vix_5d_change"] = vix_5d_change(panel)
-    feat["vix_term_ratio"] = vix_term_ratio(panel)
-    feat["yield_curve_slope"] = yield_curve_slope(panel)
-    feat["spy_drawdown"] = spy_drawdown_from_high(panel)
+    feat["amihud"]           = amihud_illiquidity(panel)   # stored in DB, not in model
+    feat["amihud_zscore"]    = amihud_zscore(panel)
+    feat["amihud_5d_change"] = amihud_5d_change(panel)
+    feat["cs_spread"]        = corwin_schultz_spread(panel)
+    feat["edge"]             = edge_spread(panel)
+    feat["vix_5d_change"]    = vix_5d_change(panel)
+    feat["vix_term_ratio"]   = vix_term_ratio(panel)
+    feat["yield_curve_slope"]= yield_curve_slope(panel)
+    feat["spy_drawdown"]     = spy_drawdown_from_high(panel)
     feat["realized_vol_20d"] = realized_vol_20d(panel)
     feat.index.name = "date"
     return feat[FEATURE_COLS]
@@ -67,7 +80,7 @@ def main() -> int:
     print(f"   Panel: {len(panel):,} rows x {panel.shape[1]} cols "
           f"({panel.index.min().date()} to {panel.index.max().date()})")
 
-    print("\n-- Computing 8 features")
+    print("\n-- Computing 9 features (amihud_zscore + amihud_5d_change replace raw amihud level)")
     features = build_features(panel)
     targets = forward_drawdown_label(panel)
     print(f"   Features: {list(features.columns)}")

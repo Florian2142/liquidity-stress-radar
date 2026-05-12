@@ -29,7 +29,12 @@ from plotly.subplots import make_subplots  # noqa: E402
 
 from liquidity_radar.config import DATA_DIR  # noqa: E402
 from liquidity_radar.data.store import get_connection, get_features_panel  # noqa: E402
-from liquidity_radar.features.liquidity import amihud_illiquidity, corwin_schultz_spread, edge_spread  # noqa: E402
+from liquidity_radar.features.liquidity import (  # noqa: E402
+    amihud_5d_change,
+    amihud_zscore,
+    corwin_schultz_spread,
+    edge_spread,
+)
 from liquidity_radar.features.macro import yield_curve_slope  # noqa: E402
 from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
 from liquidity_radar.features.volatility import vix_5d_change, vix_term_ratio  # noqa: E402
@@ -44,7 +49,8 @@ st.set_page_config(
 # ── Constants ─────────────────────────────────────────────────────────────
 
 FEATURE_LABELS: dict[str, str] = {
-    "amihud": "Amihud Illiquidity",
+    "amihud_zscore": "Amihud Z-Score (regime-adj.)",
+    "amihud_5d_change": "Amihud 5D Change (momentum)",
     "cs_spread": "Corwin-Schultz Spread",
     "edge": "EDGE Spread",
     "vix_5d_change": "VIX 5-Day Change",
@@ -203,29 +209,31 @@ def _intraday_prob(
     panel: pd.DataFrame,
     params: dict,
 ) -> float:
-    """Update yesterday's feature vector with live VIX/SPY and rerun the model."""
+    """Update yesterday's feature vector with live VIX/SPY and rerun the model.
+
+    Three features can be updated intraday:
+    - vix_5d_change: live VIX vs. 5 trading days ago
+    - vix_term_ratio: live VIX9D / VIX3M
+    - spy_drawdown: live SPY price vs. 252-day rolling high
+    The two Amihud features (amihud_zscore, amihud_5d_change) need full-day OHLCV
+    so they stay at yesterday's values.
+    """
     x = feat_clean.iloc[-1].to_numpy(dtype=float).copy()
     vix = live["vix"]
-    # vix_5d_change: live VIX minus the close 5 trading days ago
     if not np.isnan(vix):
         vix_s = panel["vix"].dropna()
         if len(vix_s) >= 5:
             x[FEATURE_COLS.index("vix_5d_change")] = vix - float(vix_s.iloc[-5])
-    # vix_term_ratio: live VIX9D / VIX3M
-    v9 = live["vix9d"]
-    v3 = live["vix3m"]
+    v9, v3 = live["vix9d"], live["vix3m"]
     if not np.isnan(v9) and not np.isnan(v3) and v3 > 0:
         x[FEATURE_COLS.index("vix_term_ratio")] = v9 / v3
-    # spy_drawdown: live SPY price vs 252-day rolling high
     spy_px = live["spy"]
     if not np.isnan(spy_px):
         spy_s = panel["adj_close"].dropna()
         if len(spy_s) >= 252:
-            rolling_high = float(spy_s.iloc[-252:].max())
-            x[FEATURE_COLS.index("spy_drawdown")] = spy_px / rolling_high - 1.0
+            x[FEATURE_COLS.index("spy_drawdown")] = spy_px / float(spy_s.iloc[-252:].max()) - 1.0
     x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
-    log_odds = float(x_scaled @ params["coef"] + params["intercept"][0])
-    return float(1.0 / (1.0 + np.exp(-log_odds)))
+    return float(1.0 / (1.0 + np.exp(-float(x_scaled @ params["coef"] + params["intercept"][0]))))
 
 
 # ── Cached data loaders ───────────────────────────────────────────────────
@@ -252,13 +260,14 @@ def load_panel() -> pd.DataFrame:
 @st.cache_data(ttl=3600)
 def load_features(_panel: pd.DataFrame) -> pd.DataFrame:
     feat = pd.DataFrame(index=_panel.index)
-    feat["amihud"] = amihud_illiquidity(_panel)
-    feat["cs_spread"] = corwin_schultz_spread(_panel)
-    feat["edge"] = edge_spread(_panel)
-    feat["vix_5d_change"] = vix_5d_change(_panel)
-    feat["vix_term_ratio"] = vix_term_ratio(_panel)
-    feat["yield_curve_slope"] = yield_curve_slope(_panel)
-    feat["spy_drawdown"] = spy_drawdown_from_high(_panel)
+    feat["amihud_zscore"]    = amihud_zscore(_panel)
+    feat["amihud_5d_change"] = amihud_5d_change(_panel)
+    feat["cs_spread"]        = corwin_schultz_spread(_panel)
+    feat["edge"]             = edge_spread(_panel)
+    feat["vix_5d_change"]    = vix_5d_change(_panel)
+    feat["vix_term_ratio"]   = vix_term_ratio(_panel)
+    feat["yield_curve_slope"]= yield_curve_slope(_panel)
+    feat["spy_drawdown"]     = spy_drawdown_from_high(_panel)
     feat["realized_vol_20d"] = realized_vol_20d(_panel)
     return feat[FEATURE_COLS]
 

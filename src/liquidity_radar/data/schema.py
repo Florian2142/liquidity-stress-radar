@@ -40,6 +40,8 @@ CREATE_STATEMENTS: list[str] = [
     CREATE TABLE IF NOT EXISTS features (
         date DATE PRIMARY KEY,
         amihud DOUBLE,
+        amihud_zscore DOUBLE,
+        amihud_5d_change DOUBLE,
         cs_spread DOUBLE,
         edge DOUBLE,
         vix_5d_change DOUBLE,
@@ -74,6 +76,12 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
     """Create all tables. Safe to call repeatedly."""
     for stmt in CREATE_STATEMENTS:
         con.execute(stmt)
+    # Migrate: add new Amihud variant columns when upgrading an existing DB.
+    for col in ("amihud_zscore", "amihud_5d_change"):
+        try:
+            con.execute(f"ALTER TABLE features ADD COLUMN IF NOT EXISTS {col} DOUBLE")
+        except Exception:
+            pass
 
 
 def list_tables(con: duckdb.DuckDBPyConnection) -> list[str]:
