@@ -241,10 +241,19 @@ def _intraday_prob(
 
 @st.cache_data(ttl=3600)
 def load_panel() -> pd.DataFrame:
+    # 1. Local dev: full DuckDB
     db_path = DATA_DIR / "lsr.duckdb"
     if db_path.exists():
         with get_connection() as con:
             return get_features_panel(con)
+    # 2. Streamlit Cloud: committed parquet snapshot (avoids yfinance rate-limits)
+    snapshot_path = DATA_DIR / "panel_snapshot.parquet"
+    if snapshot_path.exists():
+        df = pd.read_parquet(snapshot_path)
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "date"
+        return df
+    # 3. Last resort: live fetch (slow, may hit rate limits)
     from liquidity_radar.data.ingest import fetch_macro, fetch_spy, fetch_vol_indicators
 
     spy = fetch_spy()

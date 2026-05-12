@@ -35,6 +35,7 @@ env/
 data/*.duckdb
 data/*.parquet
 !data/predictions.parquet
+!data/panel_snapshot.parquet
 data/*.csv
 !data/fold_coefs.csv
 !data/.gitkeep

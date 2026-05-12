@@ -85,11 +85,15 @@ def main() -> int:
     targets = forward_drawdown_label(panel)
     print(f"   Features: {list(features.columns)}")
 
-    # ── 2. Persist updated features to DuckDB ────────────────────────────
+    # ── 2. Persist updated features to DuckDB + parquet snapshot ─────────
     with get_connection() as con:
         upsert_dataframe(con, features, "features")
         upsert_dataframe(con, targets, "targets")
     print("   Persisted features + targets to DuckDB.")
+
+    snapshot_path = DATA_DIR / "panel_snapshot.parquet"
+    panel.to_parquet(snapshot_path)
+    print(f"   Panel snapshot saved: {snapshot_path}  ({len(panel):,} rows)")
 
     # ── 3. Build combined DataFrame for walk-forward CV ───────────────────
     combined = features.join(targets[["label"]]).dropna()
