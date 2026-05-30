@@ -65,6 +65,6 @@ def forward_drawdown_label(
     )
 
     # The last `horizon` rows have undefined labels (we can't see the future).
-    out.loc[out.index[-(horizon - 1):], ["forward_drawdown_pct", "label"]] = pd.NA
+    out.loc[out.index[-(horizon - 1) :], ["forward_drawdown_pct", "label"]] = pd.NA
     out.index.name = "date"
     return out

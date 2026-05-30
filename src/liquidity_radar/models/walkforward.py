@@ -43,9 +43,7 @@ class WalkForwardCV:
         self.test_window_days = test_window_days
         self.step_freq = step_freq
 
-    def split(
-        self, df: pd.DataFrame
-    ) -> Iterator[tuple[pd.DataFrame, pd.DataFrame, int]]:
+    def split(self, df: pd.DataFrame) -> Iterator[tuple[pd.DataFrame, pd.DataFrame, int]]:
         """Yield (train_df, test_df, fold_index) triples.
 
         Parameters

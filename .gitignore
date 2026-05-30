@@ -31,7 +31,7 @@ env/
 .ipynb_checkpoints/
 *.ipynb_meta
 
-# Project-specific data — large files excluded, small artefacts committed
+# Project-specific data — large files excluded, small committed artefacts kept
 data/*.duckdb
 data/*.parquet
 !data/predictions.parquet
@@ -39,8 +39,13 @@ data/*.parquet
 data/*.csv
 !data/fold_coefs.csv
 !data/.gitkeep
-figures/
+# Robustness artefacts (small CSV/JSON) are committed so the cloud app can load them.
+!data/robustness/
 predictions/
+
+# Generated figures: keep the publication PNGs for the README, ignore anything else.
+figures/*
+!figures/*.png
 
 # Streamlit
 .streamlit/secrets.toml

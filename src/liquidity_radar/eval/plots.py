@@ -131,7 +131,7 @@ def plot_feature_importance(
     colors = ["#d6604d" if v > 0 else "#2166ac" for v in mean_sorted]
 
     fig, ax = plt.subplots(figsize=FIGSIZE_WIDE)
-    bars = ax.barh(range(len(mean_sorted)), mean_sorted.values, color=colors, alpha=0.85)
+    ax.barh(range(len(mean_sorted)), mean_sorted.values, color=colors, alpha=0.85)
     ax.errorbar(
         mean_sorted.values,
         range(len(mean_sorted)),
