@@ -48,6 +48,29 @@ from liquidity_radar.models.logistic import FEATURE_COLS  # noqa: E402
 
 st.set_page_config(page_title="Liquidity Stress Radar", page_icon="📡", layout="wide")
 
+# ── Global visual polish ─────────────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 2.4rem; max-width: 1280px;}
+    h1, h2, h3 {letter-spacing: -0.015em;}
+    /* KPI card lift on hover */
+    .lsr-kpi {transition: transform .16s ease, box-shadow .16s ease;}
+    .lsr-kpi:hover {transform: translateY(-3px); box-shadow: 0 8px 22px rgba(16,33,60,.12);}
+    /* Tabs: pill-style, clearer active state */
+    .stTabs [data-baseweb="tab-list"] {gap: 4px; border-bottom: 1px solid #e6e9f0;}
+    .stTabs [data-baseweb="tab"] {height: 44px; padding: 0 16px; border-radius: 10px 10px 0 0; font-weight: 600;}
+    .stTabs [aria-selected="true"] {background: #eef3fb; color: #2166ac;}
+    /* Native metric chips */
+    [data-testid="stMetric"] {background:#f7f9fc; border:1px solid #eceff5; border-radius:12px; padding:12px 16px;}
+    [data-testid="stMetricLabel"] p {font-weight:600; color:#5a6675;}
+    /* Dataframes a touch softer */
+    [data-testid="stDataFrame"] {border-radius: 10px; overflow: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ── Palette ────────────────────────────────────────────────────────────────
 BLUE, RED, GREEN, AMBER, ORANGE = "#2166ac", "#d6604d", "#2ecc71", "#f39c12", "#e67e22"
 GREY = "#8895a7"
@@ -81,11 +104,13 @@ def status_of(prob: float) -> tuple[str, str]:
 
 def kpi_card(label: str, value: str, sub: str = "", color: str = BLUE) -> str:
     return f"""
-    <div style="background:#f4f6fa;border-left:5px solid {color};border-radius:10px;
-                padding:16px 18px;margin-bottom:8px;height:120px;">
-        <div style="font-size:0.8rem;color:#5a6675;font-weight:600;text-transform:uppercase;
-                    letter-spacing:0.4px;">{label}</div>
-        <div style="font-size:2.0rem;font-weight:700;color:#1a1a2e;line-height:1.2;">{value}</div>
+    <div class="lsr-kpi" style="background:linear-gradient(160deg,#ffffff,#f4f6fa);
+                border-left:5px solid {color};border-radius:12px;
+                padding:16px 18px;margin-bottom:8px;height:122px;
+                box-shadow:0 1px 3px rgba(16,33,60,.06);">
+        <div style="font-size:0.78rem;color:#5a6675;font-weight:700;text-transform:uppercase;
+                    letter-spacing:0.5px;">{label}</div>
+        <div style="font-size:2.05rem;font-weight:800;color:#1a1a2e;line-height:1.2;">{value}</div>
         <div style="font-size:0.82rem;color:#5a6675;">{sub}</div>
     </div>"""
 
@@ -305,19 +330,27 @@ with tab_signal:
         live = _fetch_live()
         intraday = _fetch_intraday()
         is_open, mkt = _market_status()
-        dot = GREEN if is_open else GREY
-        anim = "pulse 1.5s infinite" if is_open else "none"
-        seen = live["fetched_at"].strftime("%H:%M:%S ET") if live else "unavailable"
+        accent = GREEN if is_open else GREY
+        pill_text = "LIVE" if is_open else "CLOSED"
+        dot_anim = "pulse 1.6s ease-in-out infinite" if is_open else "none"
+        glow = f"0 0 0 4px {accent}22" if is_open else "none"
+        seen = live["fetched_at"].strftime("%H:%M:%S ET") if live else "—"
         st.markdown(
-            f"""<style>@keyframes pulse{{0%{{opacity:1}}50%{{opacity:.3}}100%{{opacity:1}}}}</style>
-            <div style="display:flex;align-items:center;padding:8px 14px;border-radius:8px;
-                background:{"rgba(46,204,113,.08)" if is_open else "rgba(136,149,167,.08)"};
-                border-left:3px solid {dot};margin-bottom:12px;">
-              <span style="width:10px;height:10px;border-radius:50%;background:{dot};
-                animation:{anim};margin-right:8px;"></span>
-              <span style="font-weight:600;">{mkt}</span>
-              <span style="margin-left:auto;color:#8895a7;font-size:.8rem;">
-                Live · refresh 2 min · last {seen}</span>
+            f"""<style>
+            @keyframes pulse {{0%{{opacity:1;transform:scale(1)}}50%{{opacity:.35;transform:scale(.82)}}100%{{opacity:1;transform:scale(1)}}}}
+            </style>
+            <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:12px;
+                background:linear-gradient(100deg,{accent}14,transparent 70%);
+                border:1px solid {accent}33;box-shadow:0 1px 3px rgba(16,33,60,.06);margin-bottom:14px;">
+              <span style="display:inline-flex;align-items:center;gap:7px;padding:3px 11px;border-radius:999px;
+                  background:{accent};color:white;font-size:.72rem;font-weight:800;letter-spacing:.8px;
+                  box-shadow:{glow};">
+                <span style="width:8px;height:8px;border-radius:50%;background:white;
+                  animation:{dot_anim};"></span>{pill_text}
+              </span>
+              <span style="font-weight:650;color:#1a1a2e;">{mkt}</span>
+              <span style="margin-left:auto;color:#8895a7;font-size:.78rem;font-variant-numeric:tabular-nums;">
+                Auto-refresh every 2 min · updated <b style="color:#5a6675;">{seen}</b></span>
             </div>""",
             unsafe_allow_html=True,
         )
