@@ -42,7 +42,9 @@ def _retry_yf(ticker: str, start: str, attempts: int = 3, sleep: float = 2.0) ->
             last_err = e
             logger.warning("yfinance error for %s: %s (attempt %d/%d)", ticker, e, i + 1, attempts)
         time.sleep(sleep * (i + 1))
-    raise RuntimeError(f"Failed to fetch {ticker} from yfinance after {attempts} attempts: {last_err}")
+    raise RuntimeError(
+        f"Failed to fetch {ticker} from yfinance after {attempts} attempts: {last_err}"
+    )
 
 
 def fetch_spy(start: str = START_DATE) -> pd.DataFrame:
@@ -77,7 +79,11 @@ def fetch_vol_indicators(start: str = START_DATE) -> pd.DataFrame:
         except RuntimeError:
             logger.warning("could not fetch %s; column will be NaN", ticker)
             continue
-        s = df["Close"].rename(col_name.lower()) if "Close" in df.columns else df["close"].rename(col_name.lower())
+        s = (
+            df["Close"].rename(col_name.lower())
+            if "Close" in df.columns
+            else df["close"].rename(col_name.lower())
+        )
         frames.append(s.to_frame())
 
     if not frames:
@@ -124,3 +130,49 @@ def fetch_macro(start: str = START_DATE) -> pd.DataFrame:
     out.index = pd.to_datetime(out.index).normalize()
     out.index.name = "date"
     return out
+
+
+# Macro columns are forward-filled at most one trading day to bridge holidays.
+_MACRO_COLS = ["vix", "vix9d", "vix3m", "yield_10y", "yield_2y", "fed_funds"]
+
+
+def fetch_market_panel(start: str = START_DATE) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Fetch and join SPY, volatility, and macro data into one panel.
+
+    Each source is fetched independently and failures are recorded rather than
+    raised, so a transient FRED outage still yields a usable price/VIX panel.
+    SPY is mandatory; if it cannot be fetched the function raises.
+
+    Returns
+    -------
+    panel : DataFrame
+        DatetimeIndex named ``date`` with SPY OHLCV joined to vol/macro series.
+    status : dict
+        Maps each source name to ``"ok"`` or a short error string.
+    """
+    status: dict[str, str] = {}
+
+    spy = fetch_spy(start)  # mandatory — let failure propagate
+    status["spy"] = "ok"
+
+    try:
+        vol = fetch_vol_indicators(start)
+        status["vol"] = "ok"
+    except Exception as e:  # noqa: BLE001 — recorded and surfaced to the caller
+        logger.warning("volatility fetch failed: %s", e)
+        vol = pd.DataFrame(index=spy.index)
+        status["vol"] = f"failed: {e}"
+
+    try:
+        macro = fetch_macro(start)
+        status["macro"] = "ok"
+    except Exception as e:  # noqa: BLE001 — recorded and surfaced to the caller
+        logger.warning("macro fetch failed: %s", e)
+        macro = pd.DataFrame(index=spy.index)
+        status["macro"] = f"failed: {e}"
+
+    panel = spy.join(vol, how="left").join(macro, how="left")
+    present = [c for c in _MACRO_COLS if c in panel.columns]
+    panel[present] = panel[present].ffill(limit=1)
+    panel.index.name = "date"
+    return panel, status

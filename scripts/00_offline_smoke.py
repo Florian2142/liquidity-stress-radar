@@ -1,15 +1,13 @@
-"""Phase 0 offline smoke test: run the entire pipeline on synthetic data.
+"""Offline smoke test: run the entire pipeline on synthetic data, no network required.
 
-No network required. Validates that imports work, schema initialises, features
-compute, target labels are correct, DuckDB persists data, and the joined panel
-returns the expected shape.
+Validates that imports work, the schema initialises, features compute, target
+labels are correct, DuckDB persists data, and the joined panel returns the
+expected shape. Run this before ``01_initial_load.py`` to catch installation
+issues without a yfinance round-trip.
 
 Run::
 
     python scripts/00_offline_smoke.py
-
-Use this BEFORE running ``01_initial_load.py`` to catch installation issues
-without burning a yfinance round-trip.
 """
 
 from __future__ import annotations
@@ -112,7 +110,9 @@ def main() -> int:
 
     print("\n── Summary ───────────────────────────────────────────────────")
     with get_connection() as con:
-        n_features = con.execute("SELECT COUNT(*) FROM features WHERE amihud IS NOT NULL").fetchone()[0]
+        n_features = con.execute(
+            "SELECT COUNT(*) FROM features WHERE amihud IS NOT NULL"
+        ).fetchone()[0]
         n_pos = con.execute("SELECT SUM(label) FROM targets WHERE label IS NOT NULL").fetchone()[0]
         n_total = con.execute("SELECT COUNT(*) FROM targets WHERE label IS NOT NULL").fetchone()[0]
         sample = con.execute(
@@ -131,7 +131,7 @@ def main() -> int:
         print("\n   Sample (5 most recent):")
         print(sample.to_string(index=False))
 
-    print("\n✅ Offline smoke test passed. Pipeline works end-to-end.")
+    print("\nOffline smoke test passed. Pipeline works end-to-end.")
     print("   Next: run scripts/01_initial_load.py to pull real data.")
     return 0
 

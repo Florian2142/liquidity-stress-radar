@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import duckdb
 
 CREATE_STATEMENTS: list[str] = [
@@ -77,14 +79,15 @@ def init_schema(con: duckdb.DuckDBPyConnection) -> None:
     for stmt in CREATE_STATEMENTS:
         con.execute(stmt)
     # Migrate: add new Amihud variant columns when upgrading an existing DB.
+    # IF NOT EXISTS makes this idempotent; suppress only the no-op case on older engines.
     for col in ("amihud_zscore", "amihud_5d_change"):
-        try:
+        with contextlib.suppress(Exception):
             con.execute(f"ALTER TABLE features ADD COLUMN IF NOT EXISTS {col} DOUBLE")
-        except Exception:
-            pass
 
 
 def list_tables(con: duckdb.DuckDBPyConnection) -> list[str]:
     """Return user table names in the connected database."""
-    rows = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+    rows = con.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+    ).fetchall()
     return sorted(r[0] for r in rows)
