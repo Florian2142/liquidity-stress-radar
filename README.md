@@ -2,9 +2,18 @@
 
 **An interpretable, walk-forward-validated monitor for S&P 500 drawdown risk — and a test of whether market-liquidity information adds early-warning value beyond volatility signals.**
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://liquidity-stress-radar.streamlit.app)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/dashboard-streamlit-ff4b4b.svg)](https://streamlit.io/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+
+### 🚀 Live dashboard → **[liquidity-stress-radar.streamlit.app](https://liquidity-stress-radar.streamlit.app)**
+
+<!-- Replace the URL above (two places) with your exact Streamlit Community Cloud link if different. -->
+
+![Liquidity Stress Radar — live demo](figures/demo.gif)
+
+> *Demo GIF placeholder — drop a screen recording at `figures/demo.gif` and it will render here.*
 
 ---
 

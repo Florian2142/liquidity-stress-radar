@@ -43,9 +43,10 @@ data/*.csv
 !data/robustness/
 predictions/
 
-# Generated figures: keep the publication PNGs for the README, ignore anything else.
+# Generated figures: keep publication PNGs and the demo GIF for the README.
 figures/*
 !figures/*.png
+!figures/*.gif
 
 # Streamlit
 .streamlit/secrets.toml
