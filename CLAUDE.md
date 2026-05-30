@@ -4,8 +4,8 @@ This file is read automatically by Claude Code when working in this repository. 
 
 ## Project orientation
 
-- **Read `README.md` and `PLAN.md` first** before making any changes.
-- The project is structured by phases. Always know which phase you're in. If a task is from a future phase, do not implement it yet.
+- **Read `README.md` first** before making any changes — it describes the finished system, its methodology, and how to run it.
+- The deliverable is a finished research product: code, the robustness battery, figures, and the Streamlit dashboard. Keep it that way.
 
 ## Python style
 
@@ -62,8 +62,8 @@ This file is read automatically by Claude Code when working in this repository. 
 
 ## When uncertain
 
-- Re-read `PLAN.md`. The current phase usually has the answer.
-- If `PLAN.md` doesn't answer it, the choice is probably outside scope. Ask.
+- Re-read `README.md` — the methodology and scope usually have the answer.
+- If a change would expand scope beyond drawdown-risk monitoring, ask first.
 
 ## Performance expectations
 

@@ -22,12 +22,20 @@ def test_schema_creates_all_tables(tmp_path, monkeypatch):
     monkeypatch.setattr("liquidity_radar.data.store.DB_PATH", db_file)
 
     import duckdb
+
     con = duckdb.connect(str(db_file))
     init_schema(con)
     init_schema(con)  # idempotency
 
     tables = list_tables(con)
-    expected = {"spy_prices", "vol_indicators", "macro_series", "features", "targets", "predictions"}
+    expected = {
+        "spy_prices",
+        "vol_indicators",
+        "macro_series",
+        "features",
+        "targets",
+        "predictions",
+    }
     assert expected.issubset(set(tables)), f"missing tables: {expected - set(tables)}"
     con.close()
 

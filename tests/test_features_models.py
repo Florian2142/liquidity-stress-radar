@@ -13,12 +13,14 @@ import pytest  # noqa: E402
 
 from liquidity_radar.features.liquidity import corwin_schultz_spread, edge_spread  # noqa: E402
 from liquidity_radar.features.macro import ffr_change, yield_curve_slope  # noqa: E402
-from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
+from liquidity_radar.features.technical import (  # noqa: E402
+    realized_vol_20d,
+    spy_drawdown_from_high,
+)
 from liquidity_radar.features.volatility import vix_5d_change, vix_term_ratio  # noqa: E402
 from liquidity_radar.models.baseline import vix_threshold_predict  # noqa: E402
 from liquidity_radar.models.logistic import FEATURE_COLS, LogisticModel  # noqa: E402
 from liquidity_radar.models.walkforward import WalkForwardCV  # noqa: E402
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -186,9 +188,7 @@ def test_walkforward_no_leakage() -> None:
     cv = WalkForwardCV(train_min_years=2, purge_days=90, test_window_days=90)
     fold_count = 0
     for train_df, test_df, fold_idx in cv.split(combined):
-        assert train_df.index.max() < test_df.index.min(), (
-            f"Fold {fold_idx}: leakage detected"
-        )
+        assert train_df.index.max() < test_df.index.min(), f"Fold {fold_idx}: leakage detected"
         fold_count += 1
     assert fold_count > 0, "WalkForwardCV produced zero folds"
 
