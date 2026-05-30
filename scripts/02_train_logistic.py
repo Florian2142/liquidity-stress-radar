@@ -24,50 +24,19 @@ import pandas as pd  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 
 from liquidity_radar.config import DATA_DIR, ensure_dirs  # noqa: E402
-from liquidity_radar.data.store import get_connection, get_features_panel, upsert_dataframe  # noqa: E402
-from liquidity_radar.features.liquidity import (  # noqa: E402
-    amihud_5d_change,
-    amihud_illiquidity,
-    amihud_zscore,
-    corwin_schultz_spread,
-    edge_spread,
+from liquidity_radar.data.store import (  # noqa: E402
+    get_connection,
+    get_features_panel,
+    upsert_dataframe,
 )
-from liquidity_radar.features.macro import yield_curve_slope  # noqa: E402
+from liquidity_radar.features.build import build_feature_matrix  # noqa: E402
 from liquidity_radar.features.target import forward_drawdown_label  # noqa: E402
-from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
-from liquidity_radar.features.volatility import vix_5d_change, vix_term_ratio  # noqa: E402
 from liquidity_radar.models.baseline import vix_threshold_predict  # noqa: E402
 from liquidity_radar.models.logistic import FEATURE_COLS, LogisticModel  # noqa: E402
 from liquidity_radar.models.walkforward import WalkForwardCV  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("02_train_logistic")
-
-
-def build_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """Compute all 9 features from the raw joined panel.
-
-    Amihud illiquidity is represented as two complementary signals
-    (zscore + 5d-change) rather than the raw level — see scripts/04_amihud_variants.py
-    for the experiment that established this (OOS AUC +0.0094 vs. raw level).
-    The raw amihud level is also stored in DuckDB for reference but is not in FEATURE_COLS.
-
-    Returns a DataFrame with the same DatetimeIndex as ``panel`` and
-    exactly the columns listed in ``FEATURE_COLS``.
-    """
-    feat = pd.DataFrame(index=panel.index)
-    feat["amihud"]           = amihud_illiquidity(panel)   # stored in DB, not in model
-    feat["amihud_zscore"]    = amihud_zscore(panel)
-    feat["amihud_5d_change"] = amihud_5d_change(panel)
-    feat["cs_spread"]        = corwin_schultz_spread(panel)
-    feat["edge"]             = edge_spread(panel)
-    feat["vix_5d_change"]    = vix_5d_change(panel)
-    feat["vix_term_ratio"]   = vix_term_ratio(panel)
-    feat["yield_curve_slope"]= yield_curve_slope(panel)
-    feat["spy_drawdown"]     = spy_drawdown_from_high(panel)
-    feat["realized_vol_20d"] = realized_vol_20d(panel)
-    feat.index.name = "date"
-    return feat[FEATURE_COLS]
 
 
 def main() -> int:
@@ -77,17 +46,20 @@ def main() -> int:
     print("\n-- Loading raw panel from DuckDB")
     with get_connection() as con:
         panel = get_features_panel(con)
-    print(f"   Panel: {len(panel):,} rows x {panel.shape[1]} cols "
-          f"({panel.index.min().date()} to {panel.index.max().date()})")
+    print(
+        f"   Panel: {len(panel):,} rows x {panel.shape[1]} cols "
+        f"({panel.index.min().date()} to {panel.index.max().date()})"
+    )
 
     print("\n-- Computing 9 features (amihud_zscore + amihud_5d_change replace raw amihud level)")
-    features = build_features(panel)
+    features_full = build_feature_matrix(panel, include_raw_amihud=True)
+    features = features_full[FEATURE_COLS]
     targets = forward_drawdown_label(panel)
     print(f"   Features: {list(features.columns)}")
 
     # ── 2. Persist updated features to DuckDB + parquet snapshot ─────────
     with get_connection() as con:
-        upsert_dataframe(con, features, "features")
+        upsert_dataframe(con, features_full, "features")
         upsert_dataframe(con, targets, "targets")
     print("   Persisted features + targets to DuckDB.")
 
@@ -97,8 +69,10 @@ def main() -> int:
 
     # ── 3. Build combined DataFrame for walk-forward CV ───────────────────
     combined = features.join(targets[["label"]]).dropna()
-    print(f"\n-- Combined (no NaN): {len(combined):,} rows, "
-          f"positive-label rate: {combined['label'].mean():.2%}")
+    print(
+        f"\n-- Combined (no NaN): {len(combined):,} rows, "
+        f"positive-label rate: {combined['label'].mean():.2%}"
+    )
 
     # ── 4. Walk-forward CV ────────────────────────────────────────────────
     cv = WalkForwardCV()
@@ -106,8 +80,10 @@ def main() -> int:
     fold_coefs: list[pd.Series] = []
 
     print("\n-- Walk-forward folds (train ends strictly before test starts)")
-    print(f"   {'Fold':>4}  {'Train start':>12} {'Train end':>12} "
-          f"  {'Test start':>12} {'Test end':>12}  {'Gap(d)':>7}  {'N_train':>8}  {'N_test':>7}")
+    print(
+        f"   {'Fold':>4}  {'Train start':>12} {'Train end':>12} "
+        f"  {'Test start':>12} {'Test end':>12}  {'Gap(d)':>7}  {'N_train':>8}  {'N_test':>7}"
+    )
 
     for train_df, test_df, fold_idx in cv.split(combined):
         X_train = train_df[FEATURE_COLS]
@@ -126,7 +102,9 @@ def main() -> int:
         train_end = train_df.index.max()
         test_start = test_df.index.min()
         gap_days = (test_start - train_end).days
-        assert train_end < test_start, f"Fold {fold_idx}: leakage! train_end={train_end}, test_start={test_start}"
+        assert train_end < test_start, (
+            f"Fold {fold_idx}: leakage! train_end={train_end}, test_start={test_start}"
+        )
 
         print(
             f"   {fold_idx:>4}  {train_df.index.min().date()!s:>12} {train_end.date()!s:>12}"
@@ -168,7 +146,9 @@ def main() -> int:
 
     # ── 6. Coefficients with 95% CI across folds ─────────────────────────
     coef_df = pd.DataFrame(fold_coefs)
-    print(f"\n-- Logistic Regression Coefficients (mean +/- 1.96 SD across {len(fold_coefs)} folds)")
+    print(
+        f"\n-- Logistic Regression Coefficients (mean +/- 1.96 SD across {len(fold_coefs)} folds)"
+    )
     print(f"   {'Feature':<25}  {'Mean':>8}  {'95% CI lower':>14}  {'95% CI upper':>14}")
     for col in FEATURE_COLS:
         mean = coef_df[col].mean()

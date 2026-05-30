@@ -22,7 +22,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 
@@ -36,7 +35,10 @@ from liquidity_radar.features.liquidity import (  # noqa: E402
 )
 from liquidity_radar.features.macro import yield_curve_slope  # noqa: E402
 from liquidity_radar.features.target import forward_drawdown_label  # noqa: E402
-from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
+from liquidity_radar.features.technical import (  # noqa: E402
+    realized_vol_20d,
+    spy_drawdown_from_high,
+)
 from liquidity_radar.features.volatility import vix_5d_change, vix_term_ratio  # noqa: E402
 from liquidity_radar.models.logistic import LogisticModel  # noqa: E402
 from liquidity_radar.models.walkforward import WalkForwardCV  # noqa: E402
@@ -53,10 +55,10 @@ FIXED_COLS = [
 ]
 
 VARIANTS: dict[str, list[str]] = {
-    "v0  amihud_level ":  ["amihud"]              + FIXED_COLS,  # baseline
-    "v1  amihud_5d_chg":  ["amihud_5d_change"]    + FIXED_COLS,
-    "v2  amihud_zscore":  ["amihud_zscore"]        + FIXED_COLS,
-    "v3  zscore+5d_chg":  ["amihud_zscore", "amihud_5d_change"] + FIXED_COLS,
+    "v0  amihud_level ": ["amihud"] + FIXED_COLS,  # baseline
+    "v1  amihud_5d_chg": ["amihud_5d_change"] + FIXED_COLS,
+    "v2  amihud_zscore": ["amihud_zscore"] + FIXED_COLS,
+    "v3  zscore+5d_chg": ["amihud_zscore", "amihud_5d_change"] + FIXED_COLS,
 }
 
 
@@ -64,16 +66,16 @@ def _build_all_features(panel: pd.DataFrame) -> pd.DataFrame:
     """Compute every feature needed across all variants in one pass."""
     feat = pd.DataFrame(index=panel.index)
     # Amihud variants
-    feat["amihud"]           = amihud_illiquidity(panel)
-    feat["amihud_zscore"]    = amihud_zscore(panel)
+    feat["amihud"] = amihud_illiquidity(panel)
+    feat["amihud_zscore"] = amihud_zscore(panel)
     feat["amihud_5d_change"] = amihud_5d_change(panel)
     # Fixed features
-    feat["cs_spread"]        = corwin_schultz_spread(panel)
-    feat["edge"]             = edge_spread(panel)
-    feat["vix_5d_change"]    = vix_5d_change(panel)
-    feat["vix_term_ratio"]   = vix_term_ratio(panel)
-    feat["yield_curve_slope"]= yield_curve_slope(panel)
-    feat["spy_drawdown"]     = spy_drawdown_from_high(panel)
+    feat["cs_spread"] = corwin_schultz_spread(panel)
+    feat["edge"] = edge_spread(panel)
+    feat["vix_5d_change"] = vix_5d_change(panel)
+    feat["vix_term_ratio"] = vix_term_ratio(panel)
+    feat["yield_curve_slope"] = yield_curve_slope(panel)
+    feat["spy_drawdown"] = spy_drawdown_from_high(panel)
     feat["realized_vol_20d"] = realized_vol_20d(panel)
     feat.index.name = "date"
     return feat
@@ -88,17 +90,15 @@ def _run_variant(combined: pd.DataFrame, feature_cols: list[str]) -> dict:
     for train_df, test_df, _ in cv.split(combined):
         X_train = train_df[feature_cols]
         y_train = train_df["label"]
-        X_test  = test_df[feature_cols]
-        y_test  = test_df["label"]
+        X_test = test_df[feature_cols]
+        y_test = test_df["label"]
 
         model = LogisticModel()
         model.fit(X_train, y_train)
         probs = model.predict_proba(X_test)
         fold_coefs.append(model.coef_)
 
-        all_preds.append(
-            pd.DataFrame({"prob": probs, "actual": y_test.to_numpy(dtype=float)})
-        )
+        all_preds.append(pd.DataFrame({"prob": probs, "actual": y_test.to_numpy(dtype=float)}))
 
     predictions = pd.concat(all_preds, ignore_index=True)
     auc = roc_auc_score(predictions["actual"], predictions["prob"])
@@ -119,11 +119,13 @@ def main() -> int:
     print("Loading panel from DuckDB…")
     with get_connection() as con:
         panel = get_features_panel(con)
-    print(f"  Panel: {len(panel):,} rows  ({panel.index.min().date()} to {panel.index.max().date()})")
+    print(
+        f"  Panel: {len(panel):,} rows  ({panel.index.min().date()} to {panel.index.max().date()})"
+    )
 
     print("\nComputing all feature variants…")
     all_feat = _build_all_features(panel)
-    targets   = forward_drawdown_label(panel)
+    targets = forward_drawdown_label(panel)
 
     results: dict[str, dict] = {}
     for name, cols in VARIANTS.items():
@@ -141,7 +143,7 @@ def main() -> int:
     print("=" * 60)
     baseline_auc = results["v0  amihud_level "]["auc"]
     print(f"\n  {'Variant':<22}  {'OOS AUC':>8}  {'vs. baseline':>12}")
-    print(f"  {'-'*22}  {'-'*8}  {'-'*12}")
+    print(f"  {'-' * 22}  {'-' * 8}  {'-' * 12}")
     for name, r in results.items():
         delta = r["auc"] - baseline_auc
         marker = "  ← WINNER" if r["auc"] == max(v["auc"] for v in results.values()) else ""
@@ -160,8 +162,10 @@ def main() -> int:
     winner = max(results, key=lambda k: results[k]["auc"])
     print("=" * 60)
     print(f"  Recommended feature set: {winner.strip()}")
-    print(f"  OOS AUC:  {results[winner]['auc']:.4f}  "
-          f"(+{results[winner]['auc'] - baseline_auc:+.4f} vs. amihud_level)")
+    print(
+        f"  OOS AUC:  {results[winner]['auc']:.4f}  "
+        f"(+{results[winner]['auc'] - baseline_auc:+.4f} vs. amihud_level)"
+    )
     print("=" * 60)
     print("\nNext: update FEATURE_COLS in models/logistic.py and re-run 02_train_logistic.py\n")
     return 0

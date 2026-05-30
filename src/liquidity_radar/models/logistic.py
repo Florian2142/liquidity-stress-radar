@@ -24,6 +24,19 @@ FEATURE_COLS: list[str] = [
     "realized_vol_20d",
 ]
 
+# Feature groups — used for ablation studies and the robustness comparison.
+LIQUIDITY_FEATURES: list[str] = ["amihud_zscore", "amihud_5d_change", "cs_spread", "edge"]
+VOLATILITY_FEATURES: list[str] = ["vix_5d_change", "vix_term_ratio", "realized_vol_20d"]
+MACRO_FEATURES: list[str] = ["yield_curve_slope"]
+TECHNICAL_FEATURES: list[str] = ["spy_drawdown"]
+
+FEATURE_GROUPS: dict[str, list[str]] = {
+    "liquidity": LIQUIDITY_FEATURES,
+    "volatility": VOLATILITY_FEATURES,
+    "macro": MACRO_FEATURES,
+    "technical": TECHNICAL_FEATURES,
+}
+
 
 class LogisticModel:
     """Thin wrapper around sklearn LogisticRegression.
@@ -60,7 +73,7 @@ class LogisticModel:
         )
         self.feature_names_: list[str] = []
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "LogisticModel":
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> LogisticModel:
         """Fit scaler and model on training data.
 
         Parameters
