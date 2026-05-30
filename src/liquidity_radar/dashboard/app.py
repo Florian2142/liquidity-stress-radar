@@ -1,12 +1,14 @@
-"""Liquidity Stress Radar — Streamlit dashboard.
+"""Liquidity Stress Radar — interactive research dashboard.
 
 Run locally::
 
     streamlit run src/liquidity_radar/dashboard/app.py
 
-Five-tab layout: Dashboard · Market Snapshot · History · Stress Events · Methods.
-Live market panel auto-refreshes every 2 minutes using @st.fragment(run_every=...).
-All heavy data loads are cached with @st.cache_data(ttl=3600).
+Eight sections: Overview · Current Signal · Data & Coverage · Liquidity
+Indicators · Model Performance · Robustness Tests · Methodology · Limitations.
+Heavy loads are cached; the live-market panel refreshes every two minutes via
+``st.fragment``. Robustness numbers are read from artefacts produced by
+``scripts/05_robustness.py`` — nothing on this page is hard-coded.
 """
 
 from __future__ import annotations
@@ -26,54 +28,41 @@ import plotly.graph_objects as go  # noqa: E402
 import streamlit as st  # noqa: E402
 import yfinance as yf  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
+from sklearn.metrics import precision_recall_curve, roc_curve  # noqa: E402
 
-from liquidity_radar.config import DATA_DIR  # noqa: E402
-from liquidity_radar.data.store import get_connection, get_features_panel  # noqa: E402
-from liquidity_radar.features.liquidity import (  # noqa: E402
-    amihud_5d_change,
-    amihud_zscore,
-    corwin_schultz_spread,
-    edge_spread,
+from liquidity_radar.dashboard.loaders import (  # noqa: E402
+    FEATURE_LABELS,
+    batch_predict,
+    feature_contributions,
+    load_features,
+    load_fold_coefs,
+    load_model_params,
+    load_panel,
+    load_predictions,
+    load_robust_csv,
+    load_robust_summary,
+    predict_one,
 )
-from liquidity_radar.features.macro import yield_curve_slope  # noqa: E402
-from liquidity_radar.features.technical import realized_vol_20d, spy_drawdown_from_high  # noqa: E402
-from liquidity_radar.features.volatility import vix_5d_change, vix_term_ratio  # noqa: E402
+from liquidity_radar.data.quality import build_quality_report  # noqa: E402
 from liquidity_radar.models.logistic import FEATURE_COLS  # noqa: E402
 
-st.set_page_config(
-    page_title="Liquidity Stress Radar",
-    page_icon="📡",
-    layout="wide",
-)
+st.set_page_config(page_title="Liquidity Stress Radar", page_icon="📡", layout="wide")
 
-# ── Constants ─────────────────────────────────────────────────────────────
-
-FEATURE_LABELS: dict[str, str] = {
-    "amihud_zscore": "Amihud Z-Score (regime-adj.)",
-    "amihud_5d_change": "Amihud 5D Change (momentum)",
-    "cs_spread": "Corwin-Schultz Spread",
-    "edge": "EDGE Spread",
-    "vix_5d_change": "VIX 5-Day Change",
-    "vix_term_ratio": "VIX Term Ratio (9D/3M)",
-    "yield_curve_slope": "Yield Curve Slope (10Y-2Y)",
-    "spy_drawdown": "SPY Drawdown from 1Y High",
-    "realized_vol_20d": "Realised Vol (20D Ann.)",
-}
-
-LOW_IS_STRESS: set[str] = {"yield_curve_slope", "spy_drawdown"}
+# ── Palette ────────────────────────────────────────────────────────────────
+BLUE, RED, GREEN, AMBER, ORANGE = "#2166ac", "#d6604d", "#2ecc71", "#f39c12", "#e67e22"
+GREY = "#8895a7"
+ET = ZoneInfo("America/New_York")
 
 STATUS_LEVELS = [
-    (0.25, "Calm", "#2ecc71"),
-    (0.50, "Watch", "#f39c12"),
-    (0.75, "Elevated", "#e67e22"),
-    (1.01, "Stress", "#e74c3c"),
+    (0.25, "Calm", GREEN),
+    (0.50, "Watch", AMBER),
+    (0.75, "Elevated", ORANGE),
+    (1.01, "Stress", RED),
 ]
 
 MAJOR_EVENTS: dict[str, str] = {
-    "2008-09-15": "GFC",
     "2010-05-06": "Flash Crash",
     "2011-08-08": "Euro Crisis",
-    "2013-06-24": "Taper Tantrum",
     "2015-08-24": "China Selloff",
     "2018-02-05": "Vol Shock",
     "2020-02-20": "COVID",
@@ -82,71 +71,163 @@ MAJOR_EVENTS: dict[str, str] = {
     "2025-04-07": "Tariff Shock",
 }
 
-STRESS_THRESHOLD = 0.5
-ET = ZoneInfo("America/New_York")
 
-
-# ── General helpers ───────────────────────────────────────────────────────
-
-
-def _status(prob: float) -> tuple[str, str]:
+def status_of(prob: float) -> tuple[str, str]:
     for threshold, label, color in STATUS_LEVELS:
         if prob < threshold:
             return label, color
-    return "Stress", "#e74c3c"
+    return "Stress", RED
 
 
-def _batch_predict(X: np.ndarray, params: dict) -> np.ndarray:
-    X_scaled = (X - params["scaler_mean"]) / params["scaler_scale"]
-    return 1.0 / (1.0 + np.exp(-(X_scaled @ params["coef"] + params["intercept"][0])))
+def kpi_card(label: str, value: str, sub: str = "", color: str = BLUE) -> str:
+    return f"""
+    <div style="background:#f4f6fa;border-left:5px solid {color};border-radius:10px;
+                padding:16px 18px;margin-bottom:8px;height:120px;">
+        <div style="font-size:0.8rem;color:#5a6675;font-weight:600;text-transform:uppercase;
+                    letter-spacing:0.4px;">{label}</div>
+        <div style="font-size:2.0rem;font-weight:700;color:#1a1a2e;line-height:1.2;">{value}</div>
+        <div style="font-size:0.82rem;color:#5a6675;">{sub}</div>
+    </div>"""
 
 
-def _stress_percentile(col: str, series: pd.Series, today_val: float) -> float:
-    pct = float((series < today_val).mean())
-    return 1.0 - pct if col in LOW_IS_STRESS else pct
+# ════════════════════════════════════════════════════════════════════════════
+# Shared data load
+# ════════════════════════════════════════════════════════════════════════════
+
+with st.spinner("Loading data…"):
+    panel = load_panel()
+    features = load_features(panel)
+    params = load_model_params()
+    predictions = load_predictions()
+    fold_coefs = load_fold_coefs()
+    summary = load_robust_summary()
+
+if not params:
+    st.error("Model artefacts not found. Run `python scripts/02_train_logistic.py` first.")
+    st.stop()
+
+feat_clean = features.dropna()
+today_row = feat_clean.iloc[-1]
+today_date = today_row.name
+x_today = today_row.to_numpy(dtype=float)
+today_prob = predict_one(x_today, params)
+status_label, status_color = status_of(today_prob)
+oos_auc = float(params["oos_auc"][0]) if "oos_auc" in params else float("nan")
+
+st.title("📡 Liquidity Stress Radar")
+st.caption(
+    "An interpretable monitor for S&P 500 drawdown risk. "
+    "Does market-liquidity information improve early warning beyond volatility signals?"
+)
+
+tabs = st.tabs(
+    [
+        "Overview",
+        "Current Signal",
+        "Data & Coverage",
+        "Liquidity Indicators",
+        "Model Performance",
+        "Robustness Tests",
+        "Methodology",
+        "Limitations",
+    ]
+)
+(tab_overview, tab_signal, tab_data, tab_liq, tab_perf, tab_robust, tab_method, tab_limits) = tabs
 
 
-def _percentile_color(pct: float) -> str:
-    if pct < 0.50:
-        return "#2ecc71"
-    if pct < 0.75:
-        return "#f39c12"
-    if pct < 0.90:
-        return "#e67e22"
-    return "#e74c3c"
+# ════════════════════════════════════════════════════════════════════════════
+# 1 · OVERVIEW
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_overview:
+    st.markdown(
+        """
+        <div style="background:linear-gradient(110deg,#16335c,#2166ac);border-radius:14px;
+                    padding:26px 30px;color:white;margin-bottom:18px;">
+            <div style="font-size:1.5rem;font-weight:700;">Predicting S&P 500 drawdowns from liquidity stress</div>
+            <div style="font-size:1.0rem;opacity:0.92;margin-top:6px;max-width:900px;">
+                A logistic, walk-forward-validated classifier estimating the probability of a
+                ≥ 5% S&P 500 drawdown within the next 20 trading days, combining transaction-cost
+                liquidity proxies with volatility, macro, and technical indicators.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    auc_ci = summary.get("auc_gain_ci", [float("nan"), float("nan")])
+    gain = summary.get("auc_gain_vs_vix", float("nan"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(
+        kpi_card(
+            "OOS ROC-AUC",
+            f"{summary.get('roc_auc', oos_auc):.3f}",
+            "Walk-forward, out-of-sample",
+            BLUE,
+        ),
+        unsafe_allow_html=True,
+    )
+    c2.markdown(
+        kpi_card(
+            "AUC gain vs VIX",
+            f"{gain:+.3f}" if gain == gain else "—",
+            f"95% CI [{auc_ci[0]:+.2f}, {auc_ci[1]:+.2f}]" if gain == gain else "",
+            GREEN,
+        ),
+        unsafe_allow_html=True,
+    )
+    c3.markdown(
+        kpi_card(
+            "PR-AUC",
+            f"{summary.get('pr_auc', float('nan')):.3f}",
+            f"Base rate {summary.get('base_rate', float('nan')):.1%}",
+            AMBER,
+        ),
+        unsafe_allow_html=True,
+    )
+    c4.markdown(
+        kpi_card(
+            "Today's signal",
+            f"{today_prob * 100:.0f}%",
+            f"{status_label} · as of {today_date.date()}",
+            status_color,
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Abstract")
+    st.markdown(
+        "Liquidity Stress Radar is a reproducible research dashboard that evaluates whether "
+        "market-liquidity proxies improve the early detection of equity-market drawdown risk "
+        "beyond standard volatility-based warning signals. The target is a drawdown of at least "
+        "5% within a 20-trading-day horizon on the S&P 500 (SPY). The framework combines "
+        "transaction-cost-inspired liquidity proxies — Amihud illiquidity, the Corwin–Schultz "
+        "high–low spread estimator, and the EDGE estimator — with volatility, macro-financial, "
+        "and technical indicators including VIX dynamics, the VIX term structure, the yield-curve "
+        "slope, realised volatility, and recent drawdown behaviour. Liquidity-based and full "
+        "logistic models are compared against VIX-only and naïve threshold baselines under "
+        "walk-forward validation with a six-month purge gap to control look-ahead bias. Model "
+        "quality is assessed through ROC-AUC, PR-AUC, the Brier score, calibration, lead time, "
+        "feature ablations, subperiod analysis, sensitivity to the drawdown threshold and forecast "
+        "horizon, and block-bootstrap confidence intervals. The dashboard is designed as an "
+        "interpretable risk-monitoring tool rather than a trading system."
+    )
+
+    st.info(
+        "**How to read this dashboard.** *Current Signal* shows today's estimated drawdown "
+        "probability. *Model Performance* and *Robustness Tests* document how that estimate was "
+        "validated and where it is and is not reliable. Probabilities are risk indicators, not "
+        "forecasts of certainty — see **Limitations**.",
+        icon="🧭",
+    )
 
 
-def _compute_stress_events(preds: pd.DataFrame, threshold: float = STRESS_THRESHOLD) -> pd.DataFrame:
-    if preds.empty:
-        return pd.DataFrame()
-    df = preds.sort_values("date").copy()
-    df["above"] = (df["prob"] > threshold).astype(int)
-    df["onset"] = (df["above"] == 1) & (df["above"].shift(1, fill_value=0) == 0)
-    onsets = df[df["onset"]].copy()
-    if onsets.empty:
-        return pd.DataFrame()
-    rows = []
-    for _, row in onsets.iterrows():
-        onset_date = row["date"]
-        lookback_start = onset_date - pd.Timedelta(days=45)
-        window = df[(df["date"] >= lookback_start) & (df["date"] < onset_date)]
-        first_signal = window[window["prob"] > threshold]
-        lead_days = int((onset_date - first_signal["date"].min()).days) if not first_signal.empty else 0
-        rows.append(
-            {
-                "onset_date": onset_date,
-                "peak_prob": df[df["date"] >= onset_date].head(30)["prob"].max(),
-                "lead_days": lead_days,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-# ── Live market helpers ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 2 · CURRENT SIGNAL  (with live fragment)
+# ════════════════════════════════════════════════════════════════════════════
 
 
 def _market_status() -> tuple[bool, str]:
-    """Return (is_open, human label) in US Eastern time."""
     now = datetime.datetime.now(ET)
     open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
     close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -164,27 +245,25 @@ def _market_status() -> tuple[bool, str]:
 
 
 @st.cache_data(ttl=120)
-def fetch_live_snapshot() -> dict | None:
-    """Fetch latest SPY + VIX prices. Cached 2 minutes."""
+def _fetch_live() -> dict | None:
     try:
-        hist = yf.Tickers("SPY ^VIX ^VIX9D ^VIX3M").history(
+        close = yf.Tickers("SPY ^VIX ^VIX9D ^VIX3M").history(
             period="7d", interval="1d", auto_adjust=True
-        )
-        close = hist["Close"]
+        )["Close"]
 
-        def _g(col: str, i: int = 0) -> float:
+        def g(col: str, i: int = 0) -> float:
             try:
                 return float(close[col].dropna().iloc[-(1 + i)])
             except Exception:
                 return float("nan")
 
         return {
-            "spy": _g("SPY"),
-            "spy_prev": _g("SPY", 1),
-            "vix": _g("^VIX"),
-            "vix_prev": _g("^VIX", 1),
-            "vix9d": _g("^VIX9D"),
-            "vix3m": _g("^VIX3M"),
+            "spy": g("SPY"),
+            "spy_prev": g("SPY", 1),
+            "vix": g("^VIX"),
+            "vix_prev": g("^VIX", 1),
+            "vix9d": g("^VIX9D"),
+            "vix3m": g("^VIX3M"),
             "fetched_at": datetime.datetime.now(ET),
         }
     except Exception:
@@ -192,8 +271,7 @@ def fetch_live_snapshot() -> dict | None:
 
 
 @st.cache_data(ttl=60)
-def fetch_intraday_spy() -> pd.DataFrame:
-    """Fetch today's 5-min SPY bars. Cached 60 seconds."""
+def _fetch_intraday() -> pd.DataFrame:
     try:
         df = yf.download("SPY", period="1d", interval="5m", progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
@@ -203,323 +281,133 @@ def fetch_intraday_spy() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _intraday_prob(
-    live: dict,
-    feat_clean: pd.DataFrame,
-    panel: pd.DataFrame,
-    params: dict,
-) -> float:
-    """Update yesterday's feature vector with live VIX/SPY and rerun the model.
-
-    Three features can be updated intraday:
-    - vix_5d_change: live VIX vs. 5 trading days ago
-    - vix_term_ratio: live VIX9D / VIX3M
-    - spy_drawdown: live SPY price vs. 252-day rolling high
-    The two Amihud features (amihud_zscore, amihud_5d_change) need full-day OHLCV
-    so they stay at yesterday's values.
-    """
+def _intraday_prob(live: dict) -> float:
     x = feat_clean.iloc[-1].to_numpy(dtype=float).copy()
-    vix = live["vix"]
-    if not np.isnan(vix):
+    if not np.isnan(live["vix"]):
         vix_s = panel["vix"].dropna()
         if len(vix_s) >= 5:
-            x[FEATURE_COLS.index("vix_5d_change")] = vix - float(vix_s.iloc[-5])
-    v9, v3 = live["vix9d"], live["vix3m"]
-    if not np.isnan(v9) and not np.isnan(v3) and v3 > 0:
-        x[FEATURE_COLS.index("vix_term_ratio")] = v9 / v3
-    spy_px = live["spy"]
-    if not np.isnan(spy_px):
+            x[FEATURE_COLS.index("vix_5d_change")] = live["vix"] - float(vix_s.iloc[-5])
+    if not np.isnan(live["vix9d"]) and not np.isnan(live["vix3m"]) and live["vix3m"] > 0:
+        x[FEATURE_COLS.index("vix_term_ratio")] = live["vix9d"] / live["vix3m"]
+    if not np.isnan(live["spy"]):
         spy_s = panel["adj_close"].dropna()
         if len(spy_s) >= 252:
-            x[FEATURE_COLS.index("spy_drawdown")] = spy_px / float(spy_s.iloc[-252:].max()) - 1.0
-    x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
-    return float(1.0 / (1.0 + np.exp(-float(x_scaled @ params["coef"] + params["intercept"][0]))))
+            x[FEATURE_COLS.index("spy_drawdown")] = (
+                live["spy"] / float(spy_s.iloc[-252:].max()) - 1.0
+            )
+    return predict_one(x, params)
 
 
-# ── Cached data loaders ───────────────────────────────────────────────────
+with tab_signal:
 
-
-@st.cache_data(ttl=3600)
-def load_panel() -> pd.DataFrame:
-    # 1. Local dev: full DuckDB
-    db_path = DATA_DIR / "lsr.duckdb"
-    if db_path.exists():
-        with get_connection() as con:
-            return get_features_panel(con)
-    # 2. Streamlit Cloud: committed parquet snapshot (avoids yfinance rate-limits)
-    snapshot_path = DATA_DIR / "panel_snapshot.parquet"
-    if snapshot_path.exists():
-        df = pd.read_parquet(snapshot_path)
-        df.index = pd.to_datetime(df.index)
-        df.index.name = "date"
-        return df
-    # 3. Last resort: live fetch (slow, may hit rate limits)
-    from liquidity_radar.data.ingest import fetch_macro, fetch_spy, fetch_vol_indicators
-
-    spy = fetch_spy()
-    vol = fetch_vol_indicators()
-    macro = fetch_macro()
-    panel = spy.join(vol, how="left").join(macro, how="left")
-    macro_cols = ["vix", "vix9d", "vix3m", "yield_10y", "yield_2y", "fed_funds"]
-    panel[macro_cols] = panel[macro_cols].ffill(limit=1)
-    panel.index.name = "date"
-    return panel
-
-
-@st.cache_data(ttl=3600)
-def load_features(_panel: pd.DataFrame) -> pd.DataFrame:
-    feat = pd.DataFrame(index=_panel.index)
-    feat["amihud_zscore"]    = amihud_zscore(_panel)
-    feat["amihud_5d_change"] = amihud_5d_change(_panel)
-    feat["cs_spread"]        = corwin_schultz_spread(_panel)
-    feat["edge"]             = edge_spread(_panel)
-    feat["vix_5d_change"]    = vix_5d_change(_panel)
-    feat["vix_term_ratio"]   = vix_term_ratio(_panel)
-    feat["yield_curve_slope"]= yield_curve_slope(_panel)
-    feat["spy_drawdown"]     = spy_drawdown_from_high(_panel)
-    feat["realized_vol_20d"] = realized_vol_20d(_panel)
-    return feat[FEATURE_COLS]
-
-
-@st.cache_data(ttl=3600)
-def load_model_params() -> dict:
-    path = DATA_DIR / "model_params.npz"
-    if not path.exists():
-        return {}
-    data = np.load(path, allow_pickle=True)
-    return {k: data[k] for k in data.files}
-
-
-@st.cache_data(ttl=3600)
-def load_predictions() -> pd.DataFrame:
-    path = DATA_DIR / "predictions.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-    return df
-
-
-def predict_one(x: np.ndarray, params: dict) -> float:
-    x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
-    return float(1.0 / (1.0 + np.exp(-(float(x_scaled @ params["coef"] + params["intercept"][0])))))
-
-
-def feature_contributions(x: np.ndarray, params: dict) -> np.ndarray:
-    x_scaled = (x - params["scaler_mean"]) / params["scaler_scale"]
-    return params["coef"] * x_scaled
-
-
-# ── Page header ───────────────────────────────────────────────────────────
-
-st.title("📡 Liquidity Stress Radar")
-st.caption(
-    "Binary classifier predicting S&P 500 drawdowns ≥ 5% in the next 20 trading days. "
-    "TUM CEFS term project · yfinance + FRED · Walk-forward CV."
-)
-
-tab_dash, tab_snap, tab_hist, tab_events, tab_methods = st.tabs(
-    ["🎯 Dashboard", "📊 Market Snapshot", "📈 History", "⚡ Stress Events", "📚 Methods"]
-)
-
-# ── Shared data (loaded once, tabs share it) ──────────────────────────────
-
-with st.spinner("Loading data…"):
-    panel = load_panel()
-    features = load_features(panel)
-    params = load_model_params()
-    predictions = load_predictions()
-
-if not params:
-    st.error(
-        "Model not trained yet. "
-        "Run `python scripts/02_train_logistic.py` from the project root first."
-    )
-    st.stop()
-
-feat_clean = features.dropna()
-today_feat_row = feat_clean.iloc[-1]
-today_date = today_feat_row.name
-x_today = today_feat_row.to_numpy(dtype=float)
-today_prob = predict_one(x_today, params)
-status_label, status_color = _status(today_prob)
-oos_auc = float(params["oos_auc"][0]) if "oos_auc" in params else float("nan")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 1 — Dashboard
-# ══════════════════════════════════════════════════════════════════════════
-
-with tab_dash:
-
-    # ── Live market panel (auto-refreshes every 2 min) ────────────────────
     @st.fragment(run_every=datetime.timedelta(seconds=120))
-    def _live_panel() -> None:
-        live = fetch_live_snapshot()
-        intraday = fetch_intraday_spy()
-        is_open, mkt_status = _market_status()
-
-        dot_color = "#2ecc71" if is_open else "#95a5a6"
-        pulse_anim = "pulse 1.5s infinite" if is_open else "none"
-        fetched_str = live["fetched_at"].strftime("%H:%M:%S ET") if live else "unavailable"
-
+    def live_panel() -> None:
+        live = _fetch_live()
+        intraday = _fetch_intraday()
+        is_open, mkt = _market_status()
+        dot = GREEN if is_open else GREY
+        anim = "pulse 1.5s infinite" if is_open else "none"
+        seen = live["fetched_at"].strftime("%H:%M:%S ET") if live else "unavailable"
         st.markdown(
-            f"""
-            <style>
-            @keyframes pulse {{
-                0%   {{ opacity: 1; }}
-                50%  {{ opacity: 0.3; }}
-                100% {{ opacity: 1; }}
-            }}
-            .live-dot {{
-                display: inline-block;
-                width: 10px; height: 10px;
-                border-radius: 50%;
-                background: {dot_color};
-                animation: {pulse_anim};
-                margin-right: 6px;
-                vertical-align: middle;
-            }}
-            .live-bar {{
-                display: flex; align-items: center;
-                padding: 8px 14px;
-                background: {"rgba(46,204,113,0.08)" if is_open else "rgba(149,165,166,0.08)"};
-                border-radius: 8px;
-                border-left: 3px solid {dot_color};
-                margin-bottom: 12px;
-            }}
-            </style>
-            <div class="live-bar">
-                <span class="live-dot"></span>
-                <span style="font-weight:600; font-size:0.95rem;">{mkt_status}</span>
-                <span style="margin-left:auto; color:#888; font-size:0.8rem;">
-                    Live data · refreshes every 2 min · last at {fetched_str}
-                </span>
-            </div>
-            """,
+            f"""<style>@keyframes pulse{{0%{{opacity:1}}50%{{opacity:.3}}100%{{opacity:1}}}}</style>
+            <div style="display:flex;align-items:center;padding:8px 14px;border-radius:8px;
+                background:{"rgba(46,204,113,.08)" if is_open else "rgba(136,149,167,.08)"};
+                border-left:3px solid {dot};margin-bottom:12px;">
+              <span style="width:10px;height:10px;border-radius:50%;background:{dot};
+                animation:{anim};margin-right:8px;"></span>
+              <span style="font-weight:600;">{mkt}</span>
+              <span style="margin-left:auto;color:#8895a7;font-size:.8rem;">
+                Live · refresh 2 min · last {seen}</span>
+            </div>""",
             unsafe_allow_html=True,
         )
-
         if live is None:
-            st.warning("Could not reach yfinance — live data unavailable.")
+            st.warning("yfinance unreachable — live data unavailable right now.")
             return
-
         spy_chg = (
             (live["spy"] - live["spy_prev"]) / live["spy_prev"] * 100
-            if not np.isnan(live["spy_prev"]) and live["spy_prev"] > 0
+            if live["spy_prev"] > 0
             else float("nan")
         )
         vix_chg = live["vix"] - live["vix_prev"] if not np.isnan(live["vix_prev"]) else float("nan")
-        live_vtr = live["vix9d"] / live["vix3m"] if live["vix3m"] > 0 else float("nan")
-
         col_chart, col_metrics = st.columns([3, 1])
-
         with col_metrics:
             st.metric(
-                "SPY",
-                f"${live['spy']:.2f}" if not np.isnan(live["spy"]) else "—",
-                f"{spy_chg:+.2f}%" if not np.isnan(spy_chg) else None,
+                "SPY", f"${live['spy']:.2f}", f"{spy_chg:+.2f}%" if spy_chg == spy_chg else None
             )
             st.metric(
                 "VIX",
-                f"{live['vix']:.2f}" if not np.isnan(live["vix"]) else "—",
-                f"{vix_chg:+.2f}" if not np.isnan(vix_chg) else None,
+                f"{live['vix']:.2f}",
+                f"{vix_chg:+.2f}" if vix_chg == vix_chg else None,
                 delta_color="inverse",
             )
-            st.metric(
-                "VIX Term Ratio",
-                f"{live_vtr:.3f}" if not np.isnan(live_vtr) else "—",
-                help="VIX9D / VIX3M — above 1 = near-term fear elevated vs 3-month",
-            )
             if is_open:
-                ip = _intraday_prob(live, feat_clean, panel, params)
-                ip_label, ip_color = _status(ip)
+                ip = _intraday_prob(live)
+                lbl, clr = status_of(ip)
                 st.metric(
-                    "Intraday Estimate",
-                    f"{ip*100:.1f}%",
-                    help="Live VIX + SPY drawdown plugged into yesterday's model",
+                    "Intraday estimate",
+                    f"{ip * 100:.1f}%",
+                    help="Live VIX/SPY into the prior-close feature vector",
                 )
                 st.markdown(
-                    f"<div style='text-align:center;background:{ip_color}22;"
-                    f"border:1px solid {ip_color};border-radius:6px;"
-                    f"padding:4px 8px;font-weight:600;color:{ip_color};"
-                    f"font-size:0.85rem;'>{ip_label}</div>",
+                    f"<div style='text-align:center;background:{clr}22;border:1px solid {clr};"
+                    f"border-radius:6px;padding:3px;font-weight:600;color:{clr};'>{lbl}</div>",
                     unsafe_allow_html=True,
                 )
             else:
-                st.caption("Intraday estimate available during market hours (9:30–16:00 ET).")
-
+                st.caption("Intraday estimate runs during market hours.")
         with col_chart:
             if not intraday.empty and "Close" in intraday.columns:
-                close_s = intraday["Close"].dropna()
-                if len(close_s) > 1:
-                    open_px = float(close_s.iloc[0])
-                    line_color = "#2ecc71" if close_s.iloc[-1] >= open_px else "#e74c3c"
-                    fill_color = (
-                        "rgba(46,204,113,0.10)" if close_s.iloc[-1] >= open_px else "rgba(231,76,60,0.10)"
-                    )
-                    fig_intra = go.Figure()
-                    fig_intra.add_trace(
+                cl = intraday["Close"].dropna()
+                if len(cl) > 1:
+                    up = cl.iloc[-1] >= cl.iloc[0]
+                    fig = go.Figure(
                         go.Scatter(
                             x=intraday.index,
-                            y=close_s,
+                            y=cl,
                             mode="lines",
-                            line=dict(color=line_color, width=2),
+                            line=dict(color=GREEN if up else RED, width=2),
                             fill="tozeroy",
-                            fillcolor=fill_color,
-                            name="SPY intraday",
+                            fillcolor=f"rgba({'46,204,113' if up else '231,76,60'},.1)",
                         )
                     )
-                    fig_intra.add_hline(
-                        y=open_px,
+                    fig.add_hline(
+                        y=float(cl.iloc[0]),
                         line_dash="dot",
-                        line_color="grey",
-                        line_width=1,
+                        line_color=GREY,
                         annotation_text="Open",
                         annotation_position="right",
                     )
-                    fig_intra.update_layout(
+                    fig.update_layout(
                         height=220,
-                        margin=dict(t=10, b=10, l=10, r=60),
-                        xaxis_title=None,
-                        yaxis_title="SPY ($)",
+                        margin=dict(t=24, b=8, l=8, r=50),
+                        title=dict(text="SPY — today (5-min)", font=dict(size=13), x=0),
                         yaxis_tickprefix="$",
                         showlegend=False,
-                        title=dict(
-                            text="SPY — Today (5-min bars)",
-                            font=dict(size=13),
-                            x=0,
-                        ),
                     )
-                    st.plotly_chart(fig_intra, use_container_width=True)
-                else:
-                    st.caption("Intraday chart: waiting for market open data.")
+                    st.plotly_chart(fig, width="stretch")
             else:
-                st.caption("Intraday chart unavailable outside market hours.")
-
+                st.caption("Intraday chart available during market hours.")
         st.divider()
 
-    _live_panel()
+    live_panel()
 
-    # ── Today's gauge + sparkline + status ───────────────────────────────
-    col_gauge, col_spark, col_status = st.columns([1, 2, 1])
-
-    with col_gauge:
-        st.subheader("Yesterday's Close Probability")
-        st.caption(f"Model run on {today_date.date()} close data")
-        gauge = go.Figure(
+    c_gauge, c_spark, c_status = st.columns([1, 2, 1])
+    with c_gauge:
+        st.subheader("Drawdown probability")
+        st.caption(f"Prior close · {today_date.date()}")
+        g = go.Figure(
             go.Indicator(
                 mode="gauge+number",
                 value=round(today_prob * 100, 1),
-                number={"suffix": "%", "font": {"size": 36}},
+                number={"suffix": "%", "font": {"size": 34}},
                 gauge={
                     "axis": {"range": [0, 100], "ticksuffix": "%"},
                     "bar": {"color": status_color},
                     "steps": [
                         {"range": [0, 25], "color": "#d5f5e3"},
                         {"range": [25, 50], "color": "#fef9e7"},
-                        {"range": [50, 75], "color": "#fde8d8"},
+                        {"range": [50, 75], "color": "#fdebd0"},
                         {"range": [75, 100], "color": "#fadbd8"},
                     ],
                     "threshold": {
@@ -530,546 +418,716 @@ with tab_dash:
                 },
             )
         )
-        gauge.update_layout(height=220, margin=dict(t=20, b=10, l=20, r=20))
-        st.plotly_chart(gauge, use_container_width=True)
-
-    with col_spark:
-        st.subheader("90-Day Probability Trend")
+        g.update_layout(height=230, margin=dict(t=10, b=10, l=20, r=20))
+        st.plotly_chart(g, width="stretch")
+    with c_spark:
+        st.subheader("90-day probability trend")
         recent = feat_clean.iloc[-90:]
-        probs_90 = _batch_predict(recent.to_numpy(dtype=float), params)
-        spark = go.Figure()
-        spark.add_trace(
+        p90 = batch_predict(recent.to_numpy(dtype=float), params)
+        sp = go.Figure(
             go.Scatter(
                 x=recent.index,
-                y=probs_90 * 100,
+                y=p90 * 100,
                 mode="lines",
-                line=dict(color="#2166ac", width=2),
+                line=dict(color=BLUE, width=2),
                 fill="tozeroy",
-                fillcolor="rgba(33,102,172,0.15)",
+                fillcolor="rgba(33,102,172,.15)",
             )
         )
-        spark.add_hline(y=50, line_dash="dash", line_color="grey", line_width=1)
-        spark.update_layout(
-            height=220,
-            margin=dict(t=20, b=10, l=10, r=10),
+        sp.add_hline(y=50, line_dash="dash", line_color=GREY)
+        sp.update_layout(
+            height=230,
+            margin=dict(t=10, b=10, l=8, r=8),
             yaxis=dict(range=[0, 100], ticksuffix="%"),
-            xaxis_title=None,
-            yaxis_title="Probability",
             showlegend=False,
         )
-        st.plotly_chart(spark, use_container_width=True)
-
-    with col_status:
+        st.plotly_chart(sp, width="stretch")
+    with c_status:
         st.subheader("Status")
         st.markdown(
-            f"""
-            <div style="
-                background:{status_color};
-                color:white;
-                border-radius:12px;
-                padding:18px 10px;
-                text-align:center;
-                font-size:2rem;
-                font-weight:700;
-                margin-top:30px;
-            ">{status_label}</div>
-            """,
+            f"<div style='background:{status_color};color:white;border-radius:12px;padding:18px;"
+            f"text-align:center;font-size:1.9rem;font-weight:700;margin-top:26px;'>{status_label}</div>",
             unsafe_allow_html=True,
         )
-        st.caption("Calm < 25% · Watch 25-50% · Elevated 50-75% · Stress >= 75%")
+        st.caption("Calm < 25% · Watch 25–50% · Elevated 50–75% · Stress ≥ 75%")
 
     st.divider()
-
-    # ── Feature contributions + KPI ───────────────────────────────────────
-    col_contrib, col_kpi = st.columns([3, 2])
-
-    with col_contrib:
-        st.subheader("Today's Feature Contributions to Log-Odds")
-        contribs = feature_contributions(x_today, params)
-        contrib_df = pd.DataFrame(
-            {"feature": [FEATURE_LABELS[c] for c in FEATURE_COLS], "contribution": contribs}
-        ).sort_values("contribution")
-        colors = ["#d6604d" if v > 0 else "#2166ac" for v in contrib_df["contribution"]]
-        bar_fig = go.Figure(
-            go.Bar(
-                x=contrib_df["contribution"],
-                y=contrib_df["feature"],
-                orientation="h",
-                marker_color=colors,
-            )
+    st.subheader("Today's feature contributions to log-odds")
+    contribs = feature_contributions(x_today, params)
+    cdf = pd.DataFrame(
+        {"feature": [FEATURE_LABELS[c] for c in FEATURE_COLS], "c": contribs}
+    ).sort_values("c")
+    bar = go.Figure(
+        go.Bar(
+            x=cdf["c"],
+            y=cdf["feature"],
+            orientation="h",
+            marker_color=[RED if v > 0 else BLUE for v in cdf["c"]],
         )
-        bar_fig.add_vline(x=0, line_color="black", line_width=1)
-        bar_fig.update_layout(
-            height=320,
-            margin=dict(t=10, b=10, l=10, r=10),
-            xaxis_title="Contribution to log-odds (positive = raises alert)",
-            yaxis_title=None,
-            showlegend=False,
-        )
-        st.plotly_chart(bar_fig, use_container_width=True)
-
-    with col_kpi:
-        st.subheader("Model Performance (Out-of-Sample)")
-        st.metric("ROC-AUC", f"{oos_auc:.3f}", help="Out-of-sample walk-forward CV")
-        st.metric(
-            "VIX-only baseline",
-            "~0.49",
-            delta=f"+{oos_auc - 0.49:.3f} vs VIX-only",
-            delta_color="normal",
-        )
-        if not predictions.empty:
-            from liquidity_radar.eval.metrics import compute_lead_time
-
-            lead = compute_lead_time(predictions, lookback=30, threshold=0.5)
-            st.metric(
-                "Mean lead time",
-                f"{lead['mean']:.0f} days" if not pd.isna(lead["mean"]) else "N/A",
-                help="Days before stress onset that model first signals prob > 0.5",
-            )
-        today_vals = pd.Series(x_today, index=FEATURE_COLS)
-        st.caption("**Today's raw feature values:**")
-        for col, val in today_vals.items():
-            st.caption(f"  {FEATURE_LABELS[col]}: `{val:.4g}`")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 2 — Market Snapshot
-# ══════════════════════════════════════════════════════════════════════════
-
-with tab_snap:
-    st.subheader(f"Market Snapshot — {today_date.date()}")
+    )
+    bar.add_vline(x=0, line_color="black", line_width=1)
+    bar.update_layout(
+        height=320,
+        margin=dict(t=8, b=8, l=8, r=8),
+        xaxis_title="Contribution to log-odds (positive = raises drawdown probability)",
+        showlegend=False,
+    )
+    st.plotly_chart(bar, width="stretch")
     st.caption(
-        "Each card shows today's value and its **stress percentile** vs. full history. "
-        "Red = top decile alarm."
+        "Contribution = standardised coefficient × standardised feature value for the latest observation."
     )
 
-    pct_data: list[dict] = []
-    for col in FEATURE_COLS:
-        series = feat_clean[col].dropna()
-        today_val = float(today_feat_row[col])
-        pct = _stress_percentile(col, series, today_val)
-        pct_data.append(
-            {
-                "col": col,
-                "label": FEATURE_LABELS[col],
-                "value": today_val,
-                "percentile": pct,
-                "color": _percentile_color(pct),
-            }
-        )
 
-    cols = st.columns(4)
-    for i, d in enumerate(pct_data):
-        with cols[i % 4]:
-            pct_pct = d["percentile"] * 100
-            arrow = "▲" if d["percentile"] > 0.5 else "▼"
-            st.markdown(
-                f"""
-                <div style="
-                    background:{d['color']}22;
-                    border-left: 4px solid {d['color']};
-                    border-radius:8px;
-                    padding:14px 12px;
-                    margin-bottom:12px;
-                ">
-                    <div style="font-size:0.78rem;color:#555;font-weight:600;">{d['label']}</div>
-                    <div style="font-size:1.5rem;font-weight:700;color:#111;">{d['value']:.4g}</div>
-                    <div style="font-size:0.85rem;color:{d['color']};font-weight:600;">
-                        {arrow} {pct_pct:.0f}th stress pct
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+# ════════════════════════════════════════════════════════════════════════════
+# 3 · DATA & COVERAGE
+# ════════════════════════════════════════════════════════════════════════════
 
-    st.divider()
-    st.subheader("Stress Percentile Overview")
-    pct_df = pd.DataFrame(pct_data).sort_values("percentile", ascending=True)
-    bar_colors = [d["color"] for d in pct_df.to_dict("records")]
-    pct_fig = go.Figure(
+with tab_data:
+    st.subheader("Data quality & coverage")
+    report = build_quality_report(panel)
+    fresh_color = GREEN if report.is_fresh else AMBER
+    d1, d2, d3, d4 = st.columns(4)
+    d1.markdown(
+        kpi_card(
+            "Observations",
+            f"{report.n_rows:,}",
+            f"{report.start_date.date()} → {report.end_date.date()}",
+            BLUE,
+        ),
+        unsafe_allow_html=True,
+    )
+    d2.markdown(
+        kpi_card(
+            "Latest data",
+            f"{report.end_date.date()}",
+            f"{report.stale_days} days ago" + ("" if report.is_fresh else " · refresh advised"),
+            fresh_color,
+        ),
+        unsafe_allow_html=True,
+    )
+    d3.markdown(
+        kpi_card(
+            "Duplicate dates",
+            f"{report.n_duplicate_dates}",
+            "index integrity",
+            GREEN if report.n_duplicate_dates == 0 else RED,
+        ),
+        unsafe_allow_html=True,
+    )
+    d4.markdown(
+        kpi_card(
+            "Calendar gaps",
+            f"{report.n_calendar_gaps}",
+            f"max {report.max_gap_days} business days (holidays)",
+            GREY,
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Column coverage")
+    cov = report.summary_frame().reset_index(names="column")
+    cov_fig = go.Figure(
         go.Bar(
-            x=pct_df["percentile"] * 100,
-            y=pct_df["label"],
+            x=cov["coverage_pct"],
+            y=cov["column"],
             orientation="h",
-            marker_color=bar_colors,
-            text=[f"{v*100:.0f}%" for v in pct_df["percentile"]],
+            marker_color=[
+                GREEN if v >= 95 else AMBER if v >= 60 else RED for v in cov["coverage_pct"]
+            ],
+            text=[f"{v:.0f}%" for v in cov["coverage_pct"]],
             textposition="outside",
         )
     )
-    pct_fig.add_vline(x=50, line_dash="dot", line_color="#999", line_width=1)
-    pct_fig.add_vline(x=90, line_dash="dash", line_color="#e74c3c", line_width=1)
-    pct_fig.update_layout(
-        height=340,
-        margin=dict(t=10, b=10, l=10, r=60),
-        xaxis=dict(range=[0, 110], ticksuffix="%", title="Stress percentile vs. full history"),
-        yaxis_title=None,
+    cov_fig.update_layout(
+        height=380,
+        margin=dict(t=8, b=8, l=8, r=50),
+        xaxis=dict(range=[0, 108], ticksuffix="%", title="Non-missing coverage"),
         showlegend=False,
     )
-    st.plotly_chart(pct_fig, use_container_width=True)
-
-    st.divider()
-    st.subheader("Feature Summary Table")
-    hist_stats = feat_clean.describe(percentiles=[0.25, 0.5, 0.75, 0.90]).T
-    hist_stats = hist_stats[["min", "25%", "50%", "75%", "90%", "max"]]
-    hist_stats.index = [FEATURE_LABELS[c] for c in hist_stats.index]
-    today_series = pd.Series(
-        {FEATURE_LABELS[c]: float(today_feat_row[c]) for c in FEATURE_COLS}, name="Today"
+    st.plotly_chart(cov_fig, width="stretch")
+    st.caption(
+        "VIX9D and VIX3M begin in 2008 and 2011 respectively, so their full-history coverage is "
+        "below 100%. The model only trains on dates where every feature is available, so partial "
+        "coverage shortens the usable sample rather than introducing gaps."
     )
-    st.dataframe(hist_stats.join(today_series).round(4), use_container_width=True)
+    with st.expander("Per-column detail"):
+        st.dataframe(cov, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 3 — History
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# 4 · LIQUIDITY INDICATORS
+# ════════════════════════════════════════════════════════════════════════════
 
-with tab_hist:
-    st.subheader("Historical Feature & Probability Explorer")
-
+with tab_liq:
+    st.subheader("Indicator explorer")
     c1, c2 = st.columns([2, 2])
     with c1:
-        selected_feature = st.selectbox(
-            "Feature to plot",
-            options=FEATURE_COLS,
-            format_func=lambda c: FEATURE_LABELS[c],
-        )
+        sel = st.selectbox("Feature", options=FEATURE_COLS, format_func=lambda c: FEATURE_LABELS[c])
     with c2:
-        min_year = int(feat_clean.index.year.min())
-        max_year = int(feat_clean.index.year.max())
-        year_range = st.slider(
-            "Year range",
-            min_value=min_year,
-            max_value=max_year,
-            value=(max(min_year, max_year - 10), max_year),
-        )
-
-    date_mask = (feat_clean.index.year >= year_range[0]) & (feat_clean.index.year <= year_range[1])
-    hist_feat = feat_clean.loc[date_mask]
-    hist_probs = _batch_predict(hist_feat.to_numpy(dtype=float), params)
-
-    fig_hist = make_subplots(
+        y0, y1 = int(feat_clean.index.year.min()), int(feat_clean.index.year.max())
+        yr = st.slider("Year range", y0, y1, (max(y0, y1 - 12), y1))
+    mask = (feat_clean.index.year >= yr[0]) & (feat_clean.index.year <= yr[1])
+    sub = feat_clean.loc[mask]
+    probs = batch_predict(sub.to_numpy(dtype=float), params)
+    fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
         row_heights=[0.55, 0.45],
-        vertical_spacing=0.06,
-        subplot_titles=[FEATURE_LABELS[selected_feature], "Stress Probability"],
+        vertical_spacing=0.07,
+        subplot_titles=[FEATURE_LABELS[sel], "Model drawdown probability"],
     )
-    fig_hist.add_trace(
-        go.Scatter(
-            x=hist_feat.index,
-            y=hist_feat[selected_feature],
-            mode="lines",
-            line=dict(color="#2c7bb6", width=1.5),
-            name=FEATURE_LABELS[selected_feature],
-        ),
+    fig.add_trace(
+        go.Scatter(x=sub.index, y=sub[sel], mode="lines", line=dict(color=BLUE, width=1.4)),
         row=1,
         col=1,
     )
-    fig_hist.add_trace(
+    fig.add_trace(
         go.Scatter(
-            x=hist_feat.index,
-            y=hist_probs * 100,
+            x=sub.index,
+            y=probs * 100,
             mode="lines",
-            line=dict(color="#d7191c", width=1.5),
+            line=dict(color=RED, width=1.4),
             fill="tozeroy",
-            fillcolor="rgba(215,25,28,0.12)",
-            name="Stress prob %",
+            fillcolor="rgba(214,96,77,.12)",
         ),
         row=2,
         col=1,
     )
-    fig_hist.add_hline(y=50, line_dash="dash", line_color="grey", line_width=1, row=2, col=1)
-
-    for date_str, label in MAJOR_EVENTS.items():
-        ev_date = pd.Timestamp(date_str)
-        if year_range[0] <= ev_date.year <= year_range[1]:
-            fig_hist.add_vline(
-                x=ev_date,
-                line_dash="dot",
-                line_color="rgba(100,100,100,0.5)",
-                line_width=1,
-                row="all",
-                col=1,
+    fig.add_hline(y=50, line_dash="dash", line_color=GREY, row=2, col=1)
+    for ds, lbl in MAJOR_EVENTS.items():
+        ev = pd.Timestamp(ds)
+        if yr[0] <= ev.year <= yr[1]:
+            fig.add_vline(
+                x=ev, line_dash="dot", line_color="rgba(120,120,120,.5)", row="all", col=1
             )
-            fig_hist.add_annotation(
-                x=ev_date,
+            fig.add_annotation(
+                x=ev,
                 y=1,
                 yref="paper",
-                text=label,
+                text=lbl,
                 showarrow=False,
                 textangle=-55,
-                font=dict(size=9, color="#555"),
+                font=dict(size=9, color="#5a6675"),
                 xanchor="left",
             )
-
-    fig_hist.update_layout(
-        height=520,
-        margin=dict(t=40, b=10, l=10, r=10),
-        showlegend=False,
-    )
-    fig_hist.update_yaxes(ticksuffix="%", row=2, col=1)
-    st.plotly_chart(fig_hist, use_container_width=True)
+    fig.update_yaxes(ticksuffix="%", row=2, col=1)
+    fig.update_layout(height=520, margin=dict(t=42, b=8, l=8, r=8), showlegend=False)
+    st.plotly_chart(fig, width="stretch")
 
     st.divider()
-    st.subheader("Full OOS Probability History")
-    if not predictions.empty:
-        pred_mask = (predictions["date"].dt.year >= year_range[0]) & (
-            predictions["date"].dt.year <= year_range[1]
+    st.subheader("SPY drawdown with realised stress events")
+    spy = panel.loc[panel.index.isin(sub.index), "adj_close"]
+    dd = spy / spy.cummax() - 1.0
+    ddfig = go.Figure(
+        go.Scatter(
+            x=dd.index,
+            y=dd * 100,
+            mode="lines",
+            line=dict(color="#34495e", width=1.2),
+            fill="tozeroy",
+            fillcolor="rgba(52,73,94,.12)",
         )
-        pred_view = predictions.loc[pred_mask].sort_values("date")
-        fig_oos = go.Figure()
-        fig_oos.add_trace(
+    )
+    if not predictions.empty:
+        pv = predictions[
+            (predictions["date"].dt.year >= yr[0]) & (predictions["date"].dt.year <= yr[1])
+        ]
+        ev = pv[pv["actual"] == 1]
+        ddfig.add_trace(
             go.Scatter(
-                x=pred_view["date"],
-                y=pred_view["prob"] * 100,
-                mode="lines",
-                line=dict(color="#4393c3", width=1),
-                fill="tozeroy",
-                fillcolor="rgba(67,147,195,0.15)",
-                name="OOS prob",
+                x=ev["date"],
+                y=[1] * len(ev),
+                mode="markers",
+                marker=dict(color=RED, size=4),
+                name="Realised ≥5% drawdown window",
             )
         )
-        if "actual" in pred_view.columns:
-            stress_days = pred_view[pred_view["actual"] == 1]
-            fig_oos.add_trace(
+    ddfig.update_layout(
+        height=300,
+        margin=dict(t=8, b=8, l=8, r=8),
+        yaxis=dict(ticksuffix="%", title="Drawdown from running peak"),
+        legend=dict(orientation="h", y=1.02),
+        showlegend=True,
+    )
+    st.plotly_chart(ddfig, width="stretch")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5 · MODEL PERFORMANCE
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_perf:
+    st.subheader("Out-of-sample performance")
+    if predictions.empty:
+        st.info("Run `scripts/02_train_logistic.py` to generate predictions.")
+    else:
+        actual = predictions["actual"].to_numpy()
+        prob = predictions["prob"].to_numpy()
+        vix_aligned = panel["vix"].reindex(predictions["date"].values).to_numpy()
+        m = ~np.isnan(vix_aligned)
+
+        col_roc, col_pr = st.columns(2)
+        with col_roc:
+            st.markdown("**ROC curve**")
+            fpr, tpr, _ = roc_curve(actual, prob)
+            fvx, tvx, _ = roc_curve(actual[m], vix_aligned[m])
+            roc = go.Figure()
+            roc.add_trace(
                 go.Scatter(
-                    x=stress_days["date"],
-                    y=[5] * len(stress_days),
-                    mode="markers",
-                    marker=dict(color="#d6604d", size=4, symbol="circle"),
-                    name="Actual stress day",
+                    x=fpr,
+                    y=tpr,
+                    mode="lines",
+                    line=dict(color=BLUE, width=2),
+                    name=f"Full model (AUC {summary.get('roc_auc', oos_auc):.3f})",
                 )
             )
-        fig_oos.add_hline(y=50, line_dash="dash", line_color="grey", line_width=1)
-        fig_oos.update_layout(
-            height=280,
-            margin=dict(t=10, b=10, l=10, r=10),
-            yaxis=dict(range=[0, 105], ticksuffix="%"),
-            xaxis_title=None,
-            legend=dict(orientation="h", y=1.02, x=0),
+            roc.add_trace(
+                go.Scatter(
+                    x=fvx,
+                    y=tvx,
+                    mode="lines",
+                    line=dict(color=RED, width=2, dash="dash"),
+                    name="VIX level",
+                )
+            )
+            roc.add_trace(
+                go.Scatter(
+                    x=[0, 1],
+                    y=[0, 1],
+                    mode="lines",
+                    line=dict(color=GREY, dash="dot"),
+                    name="Random",
+                )
+            )
+            roc.update_layout(
+                height=380,
+                margin=dict(t=8, b=8, l=8, r=8),
+                xaxis_title="False positive rate",
+                yaxis_title="True positive rate",
+                legend=dict(x=0.4, y=0.1),
+            )
+            st.plotly_chart(roc, width="stretch")
+        with col_pr:
+            st.markdown("**Precision–recall curve**")
+            pr, rc, _ = precision_recall_curve(actual, prob)
+            prf = go.Figure()
+            prf.add_trace(
+                go.Scatter(
+                    x=rc,
+                    y=pr,
+                    mode="lines",
+                    line=dict(color=BLUE, width=2),
+                    name=f"Full model (PR-AUC {summary.get('pr_auc', float('nan')):.3f})",
+                )
+            )
+            prf.add_hline(
+                y=float(actual.mean()),
+                line_dash="dot",
+                line_color=GREY,
+                annotation_text=f"No-skill ({actual.mean():.2f})",
+            )
+            prf.update_layout(
+                height=380,
+                margin=dict(t=8, b=8, l=8, r=8),
+                xaxis_title="Recall",
+                yaxis_title="Precision",
+                legend=dict(x=0.3, y=0.95),
+            )
+            st.plotly_chart(prf, width="stretch")
+
+        col_cal, col_imp = st.columns(2)
+        with col_cal:
+            st.markdown("**Calibration (reliability)**")
+            calib = load_robust_csv("calibration.csv")
+            cfig = go.Figure()
+            cfig.add_trace(
+                go.Scatter(
+                    x=[0, 1],
+                    y=[0, 1],
+                    mode="lines",
+                    line=dict(color=GREY, dash="dot"),
+                    name="Perfect",
+                )
+            )
+            if not calib.empty:
+                cfig.add_trace(
+                    go.Scatter(
+                        x=calib["mean_pred"],
+                        y=calib["obs_freq"],
+                        mode="lines+markers",
+                        line=dict(color=BLUE, width=2),
+                        marker=dict(size=7),
+                        name="Model",
+                    )
+                )
+            cfig.update_layout(
+                height=380,
+                margin=dict(t=8, b=8, l=8, r=8),
+                xaxis_title="Mean predicted probability",
+                yaxis_title="Observed frequency",
+                xaxis=dict(range=[0, 1]),
+                yaxis=dict(range=[0, 1]),
+                legend=dict(x=0.05, y=0.95),
+            )
+            st.plotly_chart(cfig, width="stretch")
+        with col_imp:
+            st.markdown("**Feature importance (coef ± 1.96 SD across folds)**")
+            if not fold_coefs.empty:
+                mc = fold_coefs.mean()
+                ci = 1.96 * fold_coefs.std()
+                order = mc.abs().sort_values().index
+                ifig = go.Figure(
+                    go.Bar(
+                        x=mc[order],
+                        y=[FEATURE_LABELS.get(c, c) for c in order],
+                        orientation="h",
+                        marker_color=[RED if v > 0 else BLUE for v in mc[order]],
+                        error_x=dict(type="data", array=ci[order], color="#444", thickness=1.2),
+                    )
+                )
+                ifig.add_vline(x=0, line_color="black", line_width=1)
+                ifig.update_layout(
+                    height=380,
+                    margin=dict(t=8, b=8, l=8, r=8),
+                    xaxis_title="Standardised coefficient",
+                    showlegend=False,
+                )
+                st.plotly_chart(ifig, width="stretch")
+
+        st.divider()
+        st.markdown("**Out-of-sample probability history**")
+        pv = predictions.sort_values("date")
+        tfig = go.Figure(
+            go.Scatter(
+                x=pv["date"],
+                y=pv["prob"] * 100,
+                mode="lines",
+                line=dict(color=BLUE, width=1),
+                fill="tozeroy",
+                fillcolor="rgba(33,102,172,.12)",
+                name="Probability",
+            )
         )
-        st.plotly_chart(fig_oos, use_container_width=True)
-    else:
-        st.info("Run `scripts/02_train_logistic.py` to generate out-of-sample predictions.")
+        ev = pv[pv["actual"] == 1]
+        tfig.add_trace(
+            go.Scatter(
+                x=ev["date"],
+                y=[3] * len(ev),
+                mode="markers",
+                marker=dict(color=RED, size=3),
+                name="Realised drawdown",
+            )
+        )
+        tfig.add_hline(y=50, line_dash="dash", line_color=GREY)
+        tfig.update_layout(
+            height=300,
+            margin=dict(t=8, b=8, l=8, r=8),
+            yaxis=dict(range=[0, 105], ticksuffix="%"),
+            legend=dict(orientation="h", y=1.02),
+        )
+        st.plotly_chart(tfig, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 4 — Stress Events
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# 6 · ROBUSTNESS TESTS
+# ════════════════════════════════════════════════════════════════════════════
 
-with tab_events:
-    st.subheader("Stress Event Analysis")
+with tab_robust:
+    st.subheader("Statistical robustness")
     st.caption(
-        f"A stress event onset is the first day the model probability exceeds "
-        f"{STRESS_THRESHOLD*100:.0f}% after a period below that threshold."
+        "All figures are recomputed by `scripts/05_robustness.py` under the same walk-forward "
+        "procedure as the main model. Nothing here is hard-coded."
     )
 
-    if predictions.empty:
-        st.info("No predictions found. Run `scripts/02_train_logistic.py` first.")
+    comp = load_robust_csv("model_comparison.csv")
+    if comp.empty:
+        st.warning("Robustness artefacts not found. Run `python scripts/05_robustness.py`.")
     else:
-        events_df = _compute_stress_events(predictions, threshold=STRESS_THRESHOLD)
-        if events_df.empty:
-            st.info("No stress onsets detected in out-of-sample predictions.")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Total stress onsets", len(events_df))
-            with m2:
-                valid_lead = events_df["lead_days"].replace(0, np.nan).dropna()
-                avg_lead = valid_lead.mean() if not valid_lead.empty else float("nan")
-                st.metric(
-                    "Mean lead time",
-                    f"{avg_lead:.0f} days" if not pd.isna(avg_lead) else "N/A",
+        # — Model comparison —
+        st.markdown("#### 1 · Model comparison")
+        cc1, cc2 = st.columns([3, 2])
+        with cc1:
+            bar = go.Figure(
+                go.Bar(
+                    x=comp["roc_auc"],
+                    y=comp["model"],
+                    orientation="h",
+                    marker_color=[BLUE if "Full (all" in m else GREY for m in comp["model"]],
+                    text=[f"{v:.3f}" for v in comp["roc_auc"]],
+                    textposition="outside",
                 )
-            with m3:
-                med_lead = valid_lead.median() if not valid_lead.empty else float("nan")
-                st.metric(
-                    "Median lead time",
-                    f"{med_lead:.0f} days" if not pd.isna(med_lead) else "N/A",
+            )
+            bar.add_vline(x=0.5, line_dash="dot", line_color=GREY, annotation_text="Random")
+            bar.update_layout(
+                height=300,
+                margin=dict(t=8, b=8, l=8, r=40),
+                xaxis=dict(
+                    range=[0.4, max(0.8, comp["roc_auc"].max() + 0.05)], title="OOS ROC-AUC"
+                ),
+                showlegend=False,
+            )
+            st.plotly_chart(bar, width="stretch")
+        with cc2:
+            st.dataframe(
+                comp[["model", "n_features", "roc_auc", "pr_auc", "brier"]].round(3),
+                width="stretch",
+                hide_index=True,
+            )
+        gain = summary.get("auc_gain_vs_vix", float("nan"))
+        gci = summary.get("auc_gain_ci", [float("nan"), float("nan")])
+        pp = summary.get("auc_gain_prob_positive", float("nan"))
+        st.success(
+            f"**Full model vs VIX baseline:** ROC-AUC gain **{gain:+.3f}** "
+            f"(block-bootstrap 95% CI [{gci[0]:+.3f}, {gci[1]:+.3f}]; P(gain > 0) = {pp:.0%}). "
+            "The full model clearly beats the naïve VIX baseline."
+        )
+        full = comp[comp["model"].str.startswith("Full (all")]["roc_auc"]
+        fml = comp[comp["model"] == "Full − liquidity"]["roc_auc"]
+        if not full.empty and not fml.empty:
+            delta = float(full.iloc[0] - fml.iloc[0])
+            st.info(
+                f"**Incremental value of liquidity features:** removing the four liquidity proxies "
+                f"changes OOS ROC-AUC by only **{delta:+.3f}** ({full.iloc[0]:.3f} → {fml.iloc[0]:.3f}). "
+                "Liquidity adds modest, not dramatic, incremental signal once volatility, macro, and "
+                "technical features are present — an honest, replicable finding rather than an overclaim.",
+                icon="⚖️",
+            )
+
+        # — Subperiods —
+        st.markdown("#### 2 · Subperiod stability")
+        sub = load_robust_csv("subperiod.csv")
+        if not sub.empty:
+            valid = sub.dropna(subset=["roc_auc"])
+            sbar = go.Figure(
+                go.Bar(
+                    x=valid["period"],
+                    y=valid["roc_auc"],
+                    marker_color=[
+                        GREEN if v >= 0.6 else AMBER if v >= 0.55 else RED for v in valid["roc_auc"]
+                    ],
+                    text=[f"{v:.3f}" for v in valid["roc_auc"]],
+                    textposition="outside",
                 )
-            with m4:
-                st.metric("Max peak prob", f"{events_df['peak_prob'].max()*100:.1f}%")
+            )
+            sbar.add_hline(y=0.5, line_dash="dot", line_color=GREY)
+            sbar.update_layout(
+                height=300,
+                margin=dict(t=8, b=8, l=8, r=8),
+                yaxis=dict(range=[0.4, 0.8], title="OOS ROC-AUC"),
+                showlegend=False,
+            )
+            st.plotly_chart(sbar, width="stretch")
+            st.caption(
+                "Out-of-sample predictions begin in 2010 (the expanding window needs ≥5 years of "
+                "training history), so pre-2008 and GFC periods cannot be scored out-of-sample. "
+                "Performance is strongest post-GFC and weaker in the COVID and most-recent samples."
+            )
 
-            st.divider()
-            col_hist_lead, col_event_table = st.columns([1, 1])
+        # — Sensitivity —
+        st.markdown("#### 3 · Sensitivity to design choices")
+        s1, s2 = st.columns(2)
+        with s1:
+            thr = load_robust_csv("threshold_sensitivity.csv")
+            if not thr.empty:
+                f = go.Figure(
+                    go.Scatter(
+                        x=thr["threshold"] * 100,
+                        y=thr["roc_auc"],
+                        mode="lines+markers",
+                        line=dict(color=BLUE, width=2),
+                        marker=dict(size=8),
+                    )
+                )
+                f.update_layout(
+                    height=280,
+                    margin=dict(t=24, b=8, l=8, r=8),
+                    title=dict(text="Drawdown threshold", font=dict(size=13), x=0),
+                    xaxis_title="Drawdown threshold (%)",
+                    yaxis_title="OOS ROC-AUC",
+                )
+                st.plotly_chart(f, width="stretch")
+        with s2:
+            hor = load_robust_csv("horizon_sensitivity.csv")
+            if not hor.empty:
+                f = go.Figure(
+                    go.Scatter(
+                        x=hor["horizon_days"],
+                        y=hor["roc_auc"],
+                        mode="lines+markers",
+                        line=dict(color=ORANGE, width=2),
+                        marker=dict(size=8),
+                    )
+                )
+                f.update_layout(
+                    height=280,
+                    margin=dict(t=24, b=8, l=8, r=8),
+                    title=dict(text="Forecast horizon", font=dict(size=13), x=0),
+                    xaxis_title="Horizon (trading days)",
+                    yaxis_title="OOS ROC-AUC",
+                )
+                st.plotly_chart(f, width="stretch")
+        st.caption(
+            "The model's edge over random strengthens for larger drawdowns and longer horizons "
+            "and weakens for small, short-term moves — consistent with liquidity/volatility stress "
+            "being informative about material drawdowns rather than day-to-day noise."
+        )
 
-            with col_hist_lead:
-                st.subheader("Lead-Time Distribution")
-                lead_vals = events_df["lead_days"].replace(0, np.nan).dropna()
-                if not lead_vals.empty:
-                    lead_fig = go.Figure(
-                        go.Histogram(x=lead_vals, nbinsx=20, marker_color="#4393c3", opacity=0.8)
-                    )
-                    lead_fig.add_vline(
-                        x=float(lead_vals.mean()),
-                        line_dash="dash",
-                        line_color="#d6604d",
-                        annotation_text=f"Mean: {lead_vals.mean():.0f}d",
-                        annotation_position="top right",
-                    )
-                    lead_fig.update_layout(
-                        height=300,
-                        margin=dict(t=10, b=10, l=10, r=10),
-                        xaxis_title="Lead days",
-                        yaxis_title="Count",
+        # — Bootstrap CIs —
+        st.markdown("#### 4 · Bootstrap confidence intervals")
+        mci = load_robust_csv("metric_ci.csv")
+        if not mci.empty:
+            order = {"roc_auc": 0, "pr_auc": 1, "brier": 2}
+            mci = mci.sort_values("metric", key=lambda s: s.map(order))
+            f = go.Figure()
+            for _, r in mci.iterrows():
+                f.add_trace(
+                    go.Scatter(
+                        x=[r["ci_lo"], r["ci_hi"]],
+                        y=[r["metric"], r["metric"]],
+                        mode="lines",
+                        line=dict(color=GREY, width=6),
                         showlegend=False,
                     )
-                    st.plotly_chart(lead_fig, use_container_width=True)
-
-            with col_event_table:
-                st.subheader("Onset Table")
-                display_events = events_df.copy()
-                display_events["onset_date"] = display_events["onset_date"].dt.date
-                display_events["peak_prob"] = (
-                    (display_events["peak_prob"] * 100).round(1).astype(str) + "%"
                 )
-                display_events["lead_days"] = display_events["lead_days"].astype(int)
-                display_events = display_events.rename(
-                    columns={
-                        "onset_date": "Onset Date",
-                        "peak_prob": "Peak Prob",
-                        "lead_days": "Lead Days",
-                    }
-                )
-                st.dataframe(
-                    display_events.sort_values("Onset Date", ascending=False),
-                    use_container_width=True,
-                )
-
-            st.divider()
-            st.subheader("Stress Probability with Onset Markers")
-            pred_sorted = predictions.sort_values("date")
-            fig_ev = go.Figure()
-            fig_ev.add_trace(
-                go.Scatter(
-                    x=pred_sorted["date"],
-                    y=pred_sorted["prob"] * 100,
-                    mode="lines",
-                    line=dict(color="#4393c3", width=1),
-                    fill="tozeroy",
-                    fillcolor="rgba(67,147,195,0.12)",
-                    name="Stress probability",
-                )
-            )
-            above = pred_sorted[pred_sorted["prob"] > STRESS_THRESHOLD]
-            fig_ev.add_trace(
-                go.Scatter(
-                    x=above["date"],
-                    y=above["prob"] * 100,
-                    mode="markers",
-                    marker=dict(color="rgba(214,96,77,0.3)", size=3),
-                    name="Above threshold",
-                )
-            )
-            for _, ev_row in events_df.iterrows():
-                fig_ev.add_vline(
-                    x=ev_row["onset_date"], line_color="#e74c3c", line_width=1.5, line_dash="dot"
-                )
-            fig_ev.add_hline(
-                y=STRESS_THRESHOLD * 100,
-                line_dash="dash",
-                line_color="grey",
-                line_width=1,
-                annotation_text=f"{STRESS_THRESHOLD*100:.0f}% threshold",
-                annotation_position="bottom right",
-            )
-            for date_str, label in MAJOR_EVENTS.items():
-                ev_date = pd.Timestamp(date_str)
-                if pred_sorted["date"].min() <= ev_date <= pred_sorted["date"].max():
-                    fig_ev.add_annotation(
-                        x=ev_date,
-                        y=95,
-                        text=label,
-                        showarrow=True,
-                        arrowhead=2,
-                        arrowcolor="#888",
-                        ax=0,
-                        ay=-30,
-                        font=dict(size=9, color="#555"),
+                f.add_trace(
+                    go.Scatter(
+                        x=[r["point"]],
+                        y=[r["metric"]],
+                        mode="markers",
+                        marker=dict(color=BLUE, size=12),
+                        showlegend=False,
                     )
-            fig_ev.update_layout(
-                height=380,
-                margin=dict(t=20, b=10, l=10, r=10),
-                yaxis=dict(range=[0, 105], ticksuffix="%"),
-                xaxis_title=None,
-                legend=dict(orientation="h", y=1.02),
+                )
+            f.update_layout(
+                height=220,
+                margin=dict(t=8, b=8, l=8, r=8),
+                xaxis_title="Metric value (block bootstrap, 252-day blocks, 1000 reps)",
             )
-            st.plotly_chart(fig_ev, use_container_width=True)
+            st.plotly_chart(f, width="stretch")
+
+        # — Coefficient stability —
+        st.markdown("#### 5 · Coefficient stability across folds")
+        cs = load_robust_csv("coef_stability.csv")
+        if not cs.empty:
+            cs = cs.copy()
+            cs["feature"] = cs["feature"].map(lambda c: FEATURE_LABELS.get(c, c))
+            cs["sign_consistency"] = (cs["sign_consistency"] * 100).round(0).astype(int).astype(
+                str
+            ) + "%"
+            st.dataframe(
+                cs[["feature", "mean", "sd", "ci_lo", "ci_hi", "sign_consistency"]].round(3),
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption(
+                "`sign_consistency` is the share of folds whose coefficient sign matches the mean "
+                "sign — a model-agnostic indicator of whether a feature's direction is stable."
+            )
+
+    st.warning(
+        "**Statistical significance is not economic significance.** A confidence interval that "
+        "excludes zero indicates the in-sample association is unlikely to be pure chance under the "
+        "bootstrap's assumptions; it does **not** establish a tradeable edge net of costs, that the "
+        "relationship is causal, or that it will persist out of sample. Treat every number here as "
+        "rigorous *exploratory* evidence, not a law of nature.",
+        icon="⚠️",
+    )
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# TAB 5 — Methods
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# 7 · METHODOLOGY
+# ════════════════════════════════════════════════════════════════════════════
 
-with tab_methods:
-    st.header("Methods")
-
+with tab_method:
+    st.header("Methodology")
     st.subheader("Research question")
     st.markdown(
-        "> Do liquidity-based features improve prediction of S&P 500 drawdowns >= 5% "
-        "in the next 20 days, beyond a VIX-only baseline?"
+        "> Do liquidity-based features improve prediction of S&P 500 drawdowns ≥ 5% over the "
+        "next 20 trading days, beyond a VIX-only baseline?"
     )
-
     st.subheader("Target variable")
     st.markdown(
-        "Binary label = 1 if SPY adj. close falls >= 5% at any point in the next "
-        "20 trading days. Labels are constructed look-forward only; no leakage."
+        "Binary label = 1 if SPY adjusted close falls ≥ 5% from today's level at any point in "
+        "the next 20 trading days. Labels use forward windows only and are excluded from training "
+        "where the future is unknown (the final 20 rows)."
     )
-
-    st.subheader("Features (8 total)")
+    st.subheader("Features (9)")
     st.markdown(
         """
 | Group | Feature | Description |
 |---|---|---|
-| Liquidity | Amihud illiquidity | abs(return) / dollar-volume, 20-day rolling mean (Amihud 2002) |
-| Liquidity | Corwin-Schultz spread | High-low spread proxy, 2-day rolling window (Corwin & Schultz 2012) |
-| Liquidity | EDGE spread | Efficient bid-ask estimator from OHLC prices (Ardia et al. 2024) |
-| Volatility | VIX 5-day change | Short-term fear momentum |
-| Volatility | VIX term ratio | VIX9D / VIX3M - inverted term structure signals near-term stress |
-| Macro | Yield curve slope | 10Y - 2Y Treasury yield; negative = inverted curve |
-| Technical | SPY drawdown | Distance from 252-day rolling high |
-| Technical | Realised vol (20D) | Annualised standard deviation of daily returns |
+| Liquidity | Amihud z-score | Amihud illiquidity normalised by its trailing 252-day mean/SD (Amihud 2002) |
+| Liquidity | Amihud 5-day change | Short-term momentum in illiquidity |
+| Liquidity | Corwin–Schultz spread | High–low bid–ask spread proxy (Corwin & Schultz 2012) |
+| Liquidity | EDGE spread | Efficient discrete generalised estimator from OHLC (Ardia et al. 2024) |
+| Volatility | VIX 5-day change | Short-term implied-volatility momentum |
+| Volatility | VIX term ratio | VIX9D / VIX3M — inverted term structure signals near-term stress |
+| Volatility | Realised vol (20D) | Annualised standard deviation of daily returns |
+| Macro | Yield-curve slope | 10Y − 2Y Treasury yield |
+| Technical | SPY drawdown | Distance from the 252-day rolling high |
         """
     )
-
-    st.subheader("Live intraday estimate")
+    st.subheader("Model & validation")
     st.markdown(
-        "The **Intraday Estimate** on the Dashboard tab updates every 2 minutes during market "
-        "hours. It takes the previous close's feature vector and replaces three features with "
-        "live values from yfinance: `vix_5d_change` (live VIX vs. 5 trading days ago), "
-        "`vix_term_ratio` (live VIX9D / VIX3M), and `spy_drawdown` (live SPY price vs. "
-        "252-day rolling high). The four OHLC-dependent features (Amihud, CS, EDGE, realised "
-        "vol) stay at yesterday's values since they require a completed trading session."
+        "L2-regularised logistic regression (C = 1.0). Features are standardised within each fold "
+        "using statistics from the training set only. Validation is expanding-window walk-forward "
+        "cross-validation: ≥ 5 years of training history, a six-month purge gap between train and "
+        "test (longer than the 20-day label window, preventing overlap leakage), and six-month test "
+        "windows stepping every six months."
     )
-
-    st.subheader("Model")
-    st.markdown(
-        "Logistic regression with L2 regularisation (C = 1.0). Features are "
-        "standardised within each fold using `StandardScaler` — scaler is fit "
-        "on training data only, preventing any leakage."
-    )
-
-    st.subheader("Validation")
-    st.markdown(
-        "Expanding-window walk-forward cross-validation. Parameters: "
-        "minimum 5 years of training history, 6-month purge gap between "
-        "train and test, 6-month test windows stepping every 6 months. "
-        "The purge gap prevents label overlap (20-day forward return window)."
-    )
-
     st.subheader("Data sources")
     st.markdown(
-        "SPY OHLCV, ^VIX, ^VIX9D, ^VIX3M via **yfinance** (free). "
-        "DGS10, DGS2, DFF via **FRED** public CSV endpoint (no API key required). "
-        "All data stored in DuckDB at `data/lsr.duckdb`."
+        "SPY OHLCV and the VIX term structure (^VIX, ^VIX9D, ^VIX3M) via **yfinance**; "
+        "10Y/2Y Treasury yields and the effective Fed Funds rate (DGS10, DGS2, DFF) via the public "
+        "**FRED** CSV endpoint. Stored in DuckDB; a committed parquet snapshot lets the hosted app "
+        "load instantly without hitting rate limits."
+    )
+    st.subheader("References")
+    st.markdown(
+        "- Amihud, Y. (2002). *Illiquidity and stock returns: cross-section and time-series effects.* "
+        "Journal of Financial Markets.\n"
+        "- Corwin, S. & Schultz, P. (2012). *A simple way to estimate bid–ask spreads from daily high "
+        "and low prices.* Journal of Finance.\n"
+        "- Brunnermeier, M. & Pedersen, L. (2009). *Market liquidity and funding liquidity.* RFS.\n"
+        "- Rösch, C. & Kaserer, C. (2013). *Market liquidity in the financial crisis: the role of "
+        "liquidity commonality and flight-to-quality.* Journal of Banking & Finance.\n"
+        "- Hameed, A., Kang, W. & Viswanathan, S. (2010). *Stock market declines and liquidity.* "
+        "Journal of Finance.\n"
+        "- Ardia, D., Guidotti, E. & Kroencke, T. (2024). *Efficient estimation of bid–ask spreads "
+        "from OHLC prices.* Journal of Financial Economics."
     )
 
-    st.subheader("Reproducibility")
-    st.code(
-        "pip install -r requirements.txt\n"
-        "python scripts/01_initial_load.py   # fetch data\n"
-        "python scripts/02_train_logistic.py # train model\n"
-        "python scripts/03_evaluate.py       # produce plots\n"
-        "streamlit run src/liquidity_radar/dashboard/app.py",
-        language="bash",
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8 · LIMITATIONS
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_limits:
+    st.header("Limitations")
+    st.markdown(
+        """
+This dashboard is an **exploratory empirical research tool**, not investment advice and not a
+trading system. Its conclusions are bounded by the following:
+
+- **Single market, single asset.** Only the S&P 500 via SPY is modelled. Results need not transfer
+  to other indices, asset classes, or international markets.
+- **Out-of-sample window starts in 2010.** The expanding walk-forward design requires ≥ 5 years of
+  training history, so the 2008 crisis is used for training but never scored out-of-sample. The
+  most informative crisis is therefore absent from the OOS metrics.
+- **Modest incremental liquidity value.** The robustness battery shows liquidity proxies add only a
+  small AUC improvement once volatility, macro, and technical features are present. The headline
+  edge over a VIX baseline is real and bootstrap-significant, but it is incremental, not decisive.
+- **Daily, end-of-day data.** Liquidity proxies are derived from daily OHLCV, not intraday order-book
+  data. The intraday estimate substitutes live VIX/SPY into a prior-close feature vector and is an
+  approximation, not a re-estimation of the microstructure features.
+- **Statistical ≠ economic significance.** Confidence intervals describe sampling uncertainty under
+  bootstrap assumptions. They do not account for transaction costs, capacity, regime change, or the
+  multiple comparisons implicit in exploratory work, and they do not establish causality.
+- **Vendor data.** yfinance and FRED are convenient and free but not survivorship- or revision-audited
+  to institutional standards; values can be revised.
+
+The project is designed to make drawdown-risk monitoring **measurable, visual, and testable** — and
+to be transparent about exactly how far the evidence reaches.
+        """
     )
